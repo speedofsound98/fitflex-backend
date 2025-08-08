@@ -1,0 +1,27 @@
+{
+  "name": "fitflex-backend",
+  "version": "1.0.0",
+  "description": "the projects structure is as follows:",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/speedofsound98/fitflex-backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/speedofsound98/fitflex-backend/issues"
+  },
+  "homepage": "https://github.com/speedofsound98/fitflex-backend#readme",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "pg": "^8.16.3"
+  }
+}
