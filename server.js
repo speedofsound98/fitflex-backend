@@ -10,6 +10,11 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Simple health check endpoint 
+app.get('/api/ping', (req, res) => {
+  res.json({ message: 'pong from backend' });
+});
+
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
