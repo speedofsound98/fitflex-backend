@@ -1,0 +1,20 @@
+
+
+the projects structure is as follows:
+
+fitflex-frontend/
+├── public/
+├── src/
+│   ├── pages/
+│   │   └── Home.jsx
+│   │   └── Signup.jsx
+│   │   └── Login.jsx
+│   │   └── Dashboard.jsx
+│   ├── components/
+│   │   └── Navbar.jsx
+│   │   └── SignupForm.jsx
+│   ├── App.jsx
+│   └── main.jsx
+├── tailwind.config.js
+├── index.html
+└── package.json
