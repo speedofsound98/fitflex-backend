@@ -76,7 +76,7 @@ app.get('/bookings/:user_id', async (req, res) => {
   }
 });
 
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 
 // POST /signup/user
 app.post('/signup/user', async (req, res) => {
