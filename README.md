@@ -70,3 +70,6 @@ https://fitflex-backend-xxxx.onrender.com
 To redeploy:
 
 Push changes to main branch in GitHub — Render auto-redeploys.
+
+Author:
+Nadav Hardof
