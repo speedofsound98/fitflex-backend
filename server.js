@@ -219,6 +219,100 @@ app.post('/api/book', async (req, res) => {
   }
 });
 
+// =====================
+// Studio class manager
+// =====================
+
+// GET /api/studios/:studioId/classes
+app.get('/api/studios/:studioId/classes', async (req, res) => {
+  const studioId = Number(req.params.studioId);
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  try {
+    const r = await query(
+      `SELECT c.id, c.name, c.datetime, c.sport_type, c.credit_cost, c.capacity
+         FROM classes c
+        WHERE c.studio_id = $1
+        ORDER BY c.datetime DESC`,
+      [studioId]
+    );
+    res.json({ classes: r.rows });
+  } catch (e) {
+    console.error('list studio classes error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/studios/:studioId/classes
+// body: { name, datetime, sport_type, credit_cost, capacity }
+app.post('/api/studios/:studioId/classes', async (req, res) => {
+  const studioId = Number(req.params.studioId);
+  const { name, datetime, sport_type, credit_cost, capacity } = req.body || {};
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  if (!name || !datetime) return res.status(400).json({ error: 'name and datetime are required' });
+
+  // Basic normalization
+  const creditCost = Number.isFinite(+credit_cost) ? +credit_cost : 1;
+  const cap = Number.isFinite(+capacity) ? +capacity : null;
+
+  try {
+    const r = await query(
+      `INSERT INTO classes (studio_id, name, datetime, sport_type, credit_cost, capacity)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id, name, datetime, sport_type, credit_cost, capacity`,
+      [studioId, name.trim(), new Date(datetime), (sport_type || null), creditCost, cap]
+    );
+    res.status(201).json({ class: r.rows[0] });
+  } catch (e) {
+    console.error('create class error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/classes/:classId
+// body: any of { name, datetime, sport_type, credit_cost, capacity }
+app.patch('/api/classes/:classId', async (req, res) => {
+  const classId = Number(req.params.classId);
+  if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
+
+  const fields = [];
+  const values = [];
+  let idx = 1;
+  for (const [k, v] of Object.entries(req.body || {})) {
+    if (['name','datetime','sport_type','credit_cost','capacity'].includes(k)) {
+      fields.push(`${k} = $${idx++}`);
+      values.push(k === 'datetime' ? new Date(v) : v);
+    }
+  }
+  if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
+
+  try {
+    const r = await query(
+      `UPDATE classes SET ${fields.join(', ')} WHERE id = $${idx} RETURNING id, name, datetime, sport_type, credit_cost, capacity`,
+      [...values, classId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Class not found' });
+    res.json({ class: r.rows[0] });
+  } catch (e) {
+    console.error('update class error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/classes/:classId
+app.delete('/api/classes/:classId', async (req, res) => {
+  const classId = Number(req.params.classId);
+  if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
+  try {
+    // optional: cascade or rely on FK behavior; here we just try to delete
+    const r = await query('DELETE FROM classes WHERE id = $1 RETURNING id', [classId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Class not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('delete class error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ---- Start ----
 app.listen(port, '0.0.0.0', () => {
   console.log(`FitFlex backend running on http://0.0.0.0:${port}`);

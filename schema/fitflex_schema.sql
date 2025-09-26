@@ -1,23 +1,29 @@
+-- Drop old tables if you’re resetting (order matters due to FKs)
+DROP TABLE IF EXISTS bookings;
+DROP TABLE IF EXISTS classes;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS studios;
 
--- FitFlex Database Schema
-
--- Users of the platform
+-- Users
 CREATE TABLE users (
   id SERIAL PRIMARY KEY,
   name TEXT NOT NULL,
   email TEXT UNIQUE NOT NULL,
+  password TEXT NOT NULL,              -- add this
   credits INT DEFAULT 5
 );
 
--- Studios (gyms, yoga centers, etc.)
+-- Studios
 CREATE TABLE studios (
   id SERIAL PRIMARY KEY,
-  name TEXT NOT NULL,
+  name TEXT UNIQUE NOT NULL,           -- studio name unique helps UX
+  email TEXT UNIQUE NOT NULL,          -- add this
+  password TEXT NOT NULL,              -- add this
   location TEXT,
   description TEXT
 );
 
--- Fitness classes offered by studios
+-- Classes
 CREATE TABLE classes (
   id SERIAL PRIMARY KEY,
   studio_id INT REFERENCES studios(id),
@@ -28,7 +34,7 @@ CREATE TABLE classes (
   capacity INT
 );
 
--- Bookings made by users for classes
+-- Bookings
 CREATE TABLE bookings (
   id SERIAL PRIMARY KEY,
   user_id INT REFERENCES users(id),
