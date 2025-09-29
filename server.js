@@ -313,6 +313,101 @@ app.delete('/api/classes/:classId', async (req, res) => {
   }
 });
 
+
+const crypto = require('crypto');
+const bcrypt = require('bcrypt'); // or require('bcryptjs')
+
+/** POST /auth/request-password-reset
+ * Body: { email }
+ * - If email exists, generate a token, store its hash + expiry, and (in prod) email the link.
+ * - Always return 200 to avoid email enumeration.
+ */
+app.post('/auth/request-password-reset', async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'Email required' });
+
+  try {
+    const user = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (user.rows.length > 0) {
+      const userId = user.rows[0].id;
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      const expires = new Date(Date.now() + 1000 * 60 * 30); // 30 minutes
+
+      // If using users columns:
+      // await pool.query(
+      //   'UPDATE users SET reset_token_hash=$1, reset_token_expires=$2 WHERE id=$3',
+      //   [tokenHash, expires, userId]
+      // );
+
+      // If using password_resets table (recommended):
+      await pool.query(
+        'INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+        [userId, tokenHash, expires]
+      );
+
+      // In development, return the reset link so you can click it without email
+      const resetLink = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/reset?token=${token}`;
+      return res.json({ message: 'If the email exists, a reset link has been sent.', devResetLink: resetLink });
+    }
+
+    return res.json({ message: 'If the email exists, a reset link has been sent.' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+/** POST /auth/reset-password
+ * Body: { token, newPassword }
+ * - Verifies token, expiry; updates password; clears the token entry.
+ */
+app.post('/auth/reset-password', async (req, res) => {
+  const { token, newPassword } = req.body || {};
+  if (!token || !newPassword) return res.status(400).json({ error: 'Token and newPassword required' });
+
+  try {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    // If using users columns:
+    // const found = await pool.query(
+    //   'SELECT id FROM users WHERE reset_token_hash=$1 AND reset_token_expires > NOW()',
+    //   [tokenHash]
+    // );
+
+    // If using password_resets table:
+    const found = await pool.query(
+      `SELECT pr.user_id
+       FROM password_resets pr
+       WHERE pr.token_hash = $1 AND pr.expires_at > NOW()
+       ORDER BY pr.id DESC
+       LIMIT 1`,
+      [tokenHash]
+    );
+
+    if (found.rows.length === 0) {
+      return res.status(400).json({ error: 'Invalid or expired token' });
+    }
+
+    const userId = found.rows[0].user_id;
+    const hashed = await bcrypt.hash(newPassword, 10);
+
+    await pool.query('UPDATE users SET password=$1 WHERE id=$2', [hashed, userId]);
+
+    // Clear used tokens
+    // For users-column approach:
+    // await pool.query('UPDATE users SET reset_token_hash=NULL, reset_token_expires=NULL WHERE id=$1', [userId]);
+
+    // For password_resets table: delete this token (and optionally all tokens for this user)
+    await pool.query('DELETE FROM password_resets WHERE user_id=$1', [userId]);
+
+    return res.json({ message: 'Password reset successful' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+
 // ---- Start ----
 app.listen(port, '0.0.0.0', () => {
   console.log(`FitFlex backend running on http://0.0.0.0:${port}`);
