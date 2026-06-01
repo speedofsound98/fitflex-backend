@@ -50,11 +50,23 @@ async function query(sql, params) {
   }
 }
 
+// ---- Constants ----
+const SPORT_TYPES = [
+  'Yoga', 'Pilates', 'HIIT', 'Cycling', 'Boxing',
+  'Swimming', 'CrossFit', 'Dance', 'Martial Arts',
+  'Shiatsu', 'Running', 'Other'
+];
+
 // ---- Routes ----
 
 // Health
 app.get('/api/ping', (req, res) => {
   res.json({ ok: true, message: 'pong from backend' });
+});
+
+// Sport types list
+app.get('/api/sport-types', (req, res) => {
+  res.json({ sport_types: SPORT_TYPES });
 });
 
 // TEMP: debug bcrypt for Alice
@@ -102,6 +114,49 @@ app.post('/api/signup/user', async (req, res) => {
     });
   } catch (err) {
     console.error('signup/user error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/studios/:studioId  — public studio profile
+app.get('/api/studios/:studioId', async (req, res) => {
+  const studioId = Number(req.params.studioId);
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  try {
+    const r = await query(
+      'SELECT id, name, city, neighbourhood, location, about, phone, website, instagram, verified FROM studios WHERE id=$1',
+      [studioId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
+    res.json({ studio: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/studios/:studioId  — update studio profile (contact info, location)
+app.patch('/api/studios/:studioId', async (req, res) => {
+  const studioId = Number(req.params.studioId);
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  const allowed = ['about', 'phone', 'website', 'instagram', 'city', 'neighbourhood', 'location'];
+  const fields = [];
+  const values = [];
+  let idx = 1;
+  for (const [k, v] of Object.entries(req.body || {})) {
+    if (allowed.includes(k)) {
+      fields.push(`${k} = $${idx++}`);
+      values.push(v);
+    }
+  }
+  if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
+  try {
+    const r = await query(
+      `UPDATE studios SET ${fields.join(', ')} WHERE id=$${idx} RETURNING id, name, city, neighbourhood, location, about, phone, website, instagram, verified`,
+      [...values, studioId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
+    res.json({ studio: r.rows[0] });
+  } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -405,6 +460,21 @@ app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
     const r = await query('DELETE FROM users WHERE id=$1 RETURNING id', [req.params.id]);
     if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/admin/studios/:id/verify
+app.patch('/api/admin/studios/:id/verify', requireAdmin, async (req, res) => {
+  const { verified } = req.body || {};
+  try {
+    const r = await query(
+      'UPDATE studios SET verified=$1 WHERE id=$2 RETURNING id, name, verified',
+      [!!verified, req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
+    res.json({ studio: r.rows[0] });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
