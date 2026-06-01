@@ -69,6 +69,114 @@ app.get('/api/sport-types', (req, res) => {
   res.json({ sport_types: SPORT_TYPES });
 });
 
+// =====================
+// User profile & settings
+// =====================
+
+// GET /api/users/:userId/profile  — public profile
+app.get('/api/users/:userId/profile', async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  try {
+    const r = await query(
+      'SELECT id, name, bio, public_fields, credits FROM users WHERE id=$1',
+      [userId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    const user = r.rows[0];
+    const publicFields = (user.public_fields || 'name').split(',');
+    // Build public profile — only expose fields the user has made public
+    const profile = { id: user.id };
+    if (publicFields.includes('name')) profile.name = user.name;
+    if (publicFields.includes('bio')) profile.bio = user.bio;
+    if (publicFields.includes('credits')) profile.credits = user.credits;
+    res.json({ profile });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/users/:userId/settings  — private settings (should be auth-gated in future)
+app.get('/api/users/:userId/settings', async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  try {
+    const r = await query(
+      'SELECT id, name, email, bio, public_fields, credits FROM users WHERE id=$1',
+      [userId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ user: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/users/:userId/settings  — update name, bio, public_fields
+app.patch('/api/users/:userId/settings', async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  const allowed = ['name', 'bio', 'public_fields'];
+  const fields = [];
+  const values = [];
+  let idx = 1;
+  for (const [k, v] of Object.entries(req.body || {})) {
+    if (allowed.includes(k)) {
+      fields.push(`${k} = $${idx++}`);
+      values.push(v);
+    }
+  }
+  if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
+  try {
+    const r = await query(
+      `UPDATE users SET ${fields.join(', ')} WHERE id=$${idx} RETURNING id, name, email, bio, public_fields, credits`,
+      [...values, userId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ user: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/users/:userId/password  — change password
+app.patch('/api/users/:userId/password', async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'currentPassword and newPassword required' });
+  try {
+    const r = await query('SELECT password FROM users WHERE id=$1', [userId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    const ok = await bcrypt.compare(currentPassword, r.rows[0].password);
+    if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await query('UPDATE users SET password=$1 WHERE id=$2', [hashed, userId]);
+    res.json({ message: 'Password updated successfully' });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/studios/:studioId/password  — change studio password
+app.patch('/api/studios/:studioId/password', async (req, res) => {
+  const studioId = Number(req.params.studioId);
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'currentPassword and newPassword required' });
+  try {
+    const r = await query('SELECT password FROM studios WHERE id=$1', [studioId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
+    const ok = await bcrypt.compare(currentPassword, r.rows[0].password);
+    if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await query('UPDATE studios SET password=$1 WHERE id=$2', [hashed, studioId]);
+    res.json({ message: 'Password updated successfully' });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // TEMP: debug bcrypt for Alice
 app.get('/api/debug-bcrypt-alice', async (req, res) => {
   try {
