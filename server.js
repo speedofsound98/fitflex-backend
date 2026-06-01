@@ -19,16 +19,23 @@ const pool = new Pool({
 // Accept JSON bodies
 app.use(express.json());
 
-// CORS: allow Vite on localhost:5173 and your LAN IP (adjust regex if needed)
+// CORS: allow local dev + production Vercel frontend
+const allowedOrigins = [
+  'http://localhost:5173',
+  'https://your-portfolio-g56q.vercel.app',
+  // Allow any Vercel preview URLs for this project
+  /https:\/\/fitflex-frontend.*\.vercel\.app$/,
+  // Allow LAN dev
+  /http:\/\/192\.168\.\d+\.\d+(:\d+)?$/,
+  /http:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/,
+];
+
+// Also allow whatever FRONTEND_URL is set to in env
+if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
+
 app.use(
   cors({
-    origin: [
-      'http://localhost:5173',
-      // Allow any 192.168.x.x:5173 origin (dev on LAN)
-      /http:\/\/192\.168\.\d+\.\d+(:\d+)?$/,
-      /http:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/,
-      /http:\/\/172\.(1[6-9]|2\d|3[0-1])\.\d+\.\d+(:\d+)?$/,
-    ],
+    origin: allowedOrigins,
     credentials: true,
   })
 );
