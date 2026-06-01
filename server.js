@@ -337,7 +337,7 @@ app.post('/api/studios/:studioId/classes', async (req, res) => {
   if (!name || !datetime) return res.status(400).json({ error: 'name and datetime are required' });
 
   // Basic normalization
-  const creditCost = Number.isFinite(+credit_cost) ? +credit_cost : 1;
+  const creditCost = (Number.isFinite(+credit_cost) && +credit_cost >= 0) ? +credit_cost : 1;
   const cap = Number.isFinite(+capacity) ? +capacity : null;
 
   try {
