@@ -208,7 +208,30 @@ app.get('/api/classes', async (req, res) => {
   }
 });
 
-// Example booking endpoint (MVP)
+// GET /api/users/:userId/bookings
+app.get('/api/users/:userId/bookings', async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  try {
+    const r = await query(
+      `SELECT b.id, b.timestamp, b.payment_status,
+              c.id AS class_id, c.name AS class_name, c.datetime, c.sport_type, c.credit_cost,
+              s.name AS studio_name, s.location AS studio_location
+         FROM bookings b
+         JOIN classes c ON c.id = b.class_id
+         JOIN studios s ON s.id = c.studio_id
+        WHERE b.user_id = $1
+        ORDER BY c.datetime DESC`,
+      [userId]
+    );
+    res.json({ bookings: r.rows });
+  } catch (e) {
+    console.error('user bookings error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/book
 // body: { user_id, class_id }
 app.post('/api/book', async (req, res) => {
   const { user_id, class_id } = req.body || {};
