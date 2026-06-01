@@ -315,7 +315,80 @@ app.delete('/api/classes/:classId', async (req, res) => {
 
 
 const crypto = require('crypto');
-const bcrypt = require('bcrypt'); // or require('bcryptjs')
+
+// =====================
+// Admin endpoints
+// Protected by ADMIN_SECRET header (set ADMIN_SECRET in .env)
+// =====================
+
+function requireAdmin(req, res, next) {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret || req.headers['x-admin-secret'] !== secret) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// GET /api/admin/users
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  try {
+    const r = await query('SELECT id, name, email, credits FROM users ORDER BY id DESC');
+    res.json({ users: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/admin/studios
+app.get('/api/admin/studios', requireAdmin, async (req, res) => {
+  try {
+    const r = await query('SELECT id, name, email, location FROM studios ORDER BY id DESC');
+    res.json({ studios: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/admin/bookings
+app.get('/api/admin/bookings', requireAdmin, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT b.id, b.payment_status, b.timestamp,
+              u.name AS user_name, u.email AS user_email,
+              c.name AS class_name, s.name AS studio_name
+         FROM bookings b
+         JOIN users u ON u.id = b.user_id
+         JOIN classes c ON c.id = b.class_id
+         JOIN studios s ON s.id = c.studio_id
+        ORDER BY b.timestamp DESC`
+    );
+    res.json({ bookings: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/admin/users/:id
+app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
+  try {
+    const r = await query('DELETE FROM users WHERE id=$1 RETURNING id', [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/admin/studios/:id
+app.delete('/api/admin/studios/:id', requireAdmin, async (req, res) => {
+  try {
+    const r = await query('DELETE FROM studios WHERE id=$1 RETURNING id', [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 /** POST /auth/request-password-reset
  * Body: { email }
