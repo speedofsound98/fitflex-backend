@@ -83,14 +83,14 @@ app.post('/api/signup/user', async (req, res) => {
     }
 
     const hashed = await bcrypt.hash(password, 10);
-    await query(
-      'INSERT INTO users (name, email, password) VALUES ($1, $2, $3)',
+    const inserted = await query(
+      'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id',
       [name, email, hashed]
     );
+    const id = inserted.rows[0].id;
 
-    // Minimal payload for UI
     res.status(201).json({
-      user: { name, email, role: 'user' },
+      user: { id, name, email, role: 'user' },
       message: 'User registered successfully',
     });
   } catch (err) {
@@ -123,13 +123,14 @@ app.post('/api/signup/studio', async (req, res) => {
     }
 
     const hashed = await bcrypt.hash(password, 10);
-    await query(
-      'INSERT INTO studios (name, email, password, location) VALUES ($1, $2, $3, $4)',
+    const inserted = await query(
+      'INSERT INTO studios (name, email, password, location) VALUES ($1, $2, $3, $4) RETURNING id',
       [name, email, hashed, location || null]
     );
+    const id = inserted.rows[0].id;
 
     res.status(201).json({
-      user: { name, email, role: 'studio' },
+      user: { id, name, email, role: 'studio' },
       message: 'Studio registered successfully',
     });
   } catch (err) {
