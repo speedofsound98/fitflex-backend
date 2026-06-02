@@ -1,46 +1,63 @@
 // server.js (CommonJS)
-// npm i express pg cors bcryptjs dotenv
-// Ensure you have a .env with PORT and DATABASE_URL
+// npm i express pg cors bcryptjs dotenv jsonwebtoken cookie-parser express-rate-limit resend
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
+const { rateLimit } = require('express-rate-limit');
+const { Resend } = require('resend');
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 const app = express();
 
 // ---- Config ----
 const port = process.env.PORT || 3000;
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const JWT_SECRET = process.env.JWT_SECRET || 'fitflex-dev-secret-change-in-prod';
+const isProd = process.env.NODE_ENV === 'production';
 
-// Accept JSON bodies
+// Resend email client (only active when RESEND_API_KEY is set)
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'FitFlex <noreply@fitflex.app>';
+
+// ---- Middleware ----
 app.use(express.json());
+app.use(cookieParser());
 
 // CORS: allow local dev + production Vercel frontend
 const allowedOrigins = [
   'http://localhost:5173',
   'https://your-portfolio-g56q.vercel.app',
-  // Allow any Vercel preview URLs for this project
   /https:\/\/fitflex-frontend.*\.vercel\.app$/,
-  // Allow LAN dev
   /http:\/\/192\.168\.\d+\.\d+(:\d+)?$/,
   /http:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/,
 ];
-
-// Also allow whatever FRONTEND_URL is set to in env
 if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 
-app.use(
-  cors({
-    origin: allowedOrigins,
-    credentials: true,
-  })
-);
+app.use(cors({ origin: allowedOrigins, credentials: true }));
 
-// ---- Helpers ----
+// ---- Rate limiting ----
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const resetLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,
+  message: { error: 'Too many password reset requests. Please try again in 1 hour.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// ---- DB helper ----
 async function query(sql, params) {
   const client = await pool.connect();
   try {
@@ -50,6 +67,171 @@ async function query(sql, params) {
   }
 }
 
+// ---- JWT / Cookie helpers ----
+function signToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+}
+
+function setAuthCookie(res, token) {
+  res.cookie('fitflex_token', token, {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  });
+}
+
+// requireAuth middleware — verifies JWT from cookie
+function requireAuth(req, res, next) {
+  const token = req.cookies?.fitflex_token;
+  if (!token) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Session expired — please log in again' });
+  }
+}
+
+// ---- Email helpers ----
+
+// Format a Date for .ics (YYYYMMDDTHHMMSSZ)
+function toICSDate(date) {
+  return new Date(date).toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+}
+
+// Generate an .ics calendar invite string
+function buildICS({ uid, summary, dtstart, dtend, location, description, organizer }) {
+  const now = toICSDate(new Date());
+  return [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//FitFlex//FitFlex//EN',
+    'CALSCALE:GREGORIAN',
+    'METHOD:REQUEST',
+    'BEGIN:VEVENT',
+    `UID:${uid}@fitflex.app`,
+    `DTSTAMP:${now}`,
+    `DTSTART:${toICSDate(dtstart)}`,
+    `DTEND:${toICSDate(dtend)}`,
+    `SUMMARY:${summary}`,
+    location ? `LOCATION:${location}` : '',
+    description ? `DESCRIPTION:${description.replace(/\n/g, '\\n')}` : '',
+    organizer ? `ORGANIZER;CN="${organizer.name}":mailto:${organizer.email}` : '',
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ].filter(Boolean).join('\r\n');
+}
+
+// Send an email via Resend (gracefully no-ops if not configured)
+async function sendEmail({ to, subject, html, icsContent }) {
+  if (!resend) {
+    console.log(`[email] Not configured — would have sent to ${to}: ${subject}`);
+    return;
+  }
+  try {
+    const payload = { from: FROM_EMAIL, to: Array.isArray(to) ? to : [to], subject, html };
+    if (icsContent) {
+      payload.attachments = [{
+        filename: 'event.ics',
+        content: Buffer.from(icsContent).toString('base64'),
+      }];
+    }
+    await resend.emails.send(payload);
+  } catch (err) {
+    console.error('[email] Send failed:', err.message);
+  }
+}
+
+// Booking confirmation email (sent to user + studio)
+async function sendBookingConfirmation({ userEmail, userName, studioEmail, studioName, className, datetime, location, creditCost, bookingId }) {
+  const classDate = new Date(datetime);
+  const classEnd = new Date(classDate.getTime() + 60 * 60 * 1000); // assume 1hr
+  const friendlyDate = classDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  const friendlyTime = classDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+  const icsContent = buildICS({
+    uid: `booking-${bookingId}`,
+    summary: `${className} @ ${studioName}`,
+    dtstart: classDate,
+    dtend: classEnd,
+    location: location || studioName,
+    description: `FitFlex class booked by ${userName}.\nCredits used: ${creditCost}`,
+    organizer: { name: studioName, email: studioEmail },
+  });
+
+  const userHtml = `
+    <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
+      <h2 style="color:#2563eb">Booking Confirmed! 🎉</h2>
+      <p>Hi ${userName}, you're all set for:</p>
+      <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
+        <p style="margin:0 0 6px"><strong>${className}</strong></p>
+        <p style="margin:0 0 4px;color:#555">📍 ${studioName}${location ? ' · ' + location : ''}</p>
+        <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
+        <p style="margin:0;color:#555">🕐 ${friendlyTime}</p>
+      </div>
+      <p style="color:#555">Credits used: <strong>${creditCost}</strong></p>
+      <p style="color:#888;font-size:13px">The .ics file attached to this email lets you add the class to Google Calendar, Apple Calendar, or Outlook.</p>
+      <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+      <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
+    </div>`;
+
+  const studioHtml = `
+    <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
+      <h2 style="color:#2563eb">New Booking 📋</h2>
+      <p><strong>${userName}</strong> has booked a spot in:</p>
+      <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
+        <p style="margin:0 0 6px"><strong>${className}</strong></p>
+        <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
+        <p style="margin:0;color:#555">🕐 ${friendlyTime}</p>
+      </div>
+      <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+      <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
+    </div>`;
+
+  await Promise.all([
+    sendEmail({ to: userEmail, subject: `Booking confirmed: ${className}`, html: userHtml, icsContent }),
+    sendEmail({ to: studioEmail, subject: `New booking: ${className} — ${userName}`, html: studioHtml }),
+  ]);
+}
+
+// Cancellation email (sent to user + studio)
+async function sendCancellationNotice({ userEmail, userName, studioEmail, studioName, className, datetime, creditCost }) {
+  const classDate = new Date(datetime);
+  const friendlyDate = classDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+  const friendlyTime = classDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+  const userHtml = `
+    <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
+      <h2 style="color:#dc2626">Booking Cancelled</h2>
+      <p>Hi ${userName}, your booking has been cancelled:</p>
+      <div style="background:#fef2f2;border-radius:12px;padding:16px;margin:16px 0">
+        <p style="margin:0 0 6px"><strong>${className}</strong> @ ${studioName}</p>
+        <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate} · ${friendlyTime}</p>
+      </div>
+      <p style="color:#555"><strong>${creditCost} credit${creditCost !== 1 ? 's' : ''}</strong> have been refunded to your account.</p>
+      <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+      <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
+    </div>`;
+
+  const studioHtml = `
+    <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
+      <h2 style="color:#dc2626">Booking Cancelled</h2>
+      <p><strong>${userName}</strong> has cancelled their booking for:</p>
+      <div style="background:#fef2f2;border-radius:12px;padding:16px;margin:16px 0">
+        <p style="margin:0 0 6px"><strong>${className}</strong></p>
+        <p style="margin:0;color:#555">📅 ${friendlyDate} · ${friendlyTime}</p>
+      </div>
+      <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+      <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
+    </div>`;
+
+  await Promise.all([
+    sendEmail({ to: userEmail, subject: `Booking cancelled: ${className}`, html: userHtml }),
+    sendEmail({ to: studioEmail, subject: `Cancellation: ${className} — ${userName}`, html: studioHtml }),
+  ]);
+}
+
 // ---- Constants ----
 const SPORT_TYPES = [
   'Yoga', 'Pilates', 'HIIT', 'Cycling', 'Boxing',
@@ -57,171 +239,27 @@ const SPORT_TYPES = [
   'Shiatsu', 'Running', 'Other'
 ];
 
-// ---- Routes ----
-
-// Health
-app.get('/api/ping', (req, res) => {
-  res.json({ ok: true, message: 'pong from backend' });
-});
-
-// Sport types list
-app.get('/api/sport-types', (req, res) => {
-  res.json({ sport_types: SPORT_TYPES });
-});
-
 // =====================
-// User profile & settings
+// PUBLIC ROUTES
 // =====================
 
-// GET /api/users/:userId/profile  — public profile
-app.get('/api/users/:userId/profile', async (req, res) => {
-  const userId = Number(req.params.userId);
-  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+app.get('/api/ping', (req, res) => res.json({ ok: true, message: 'pong from backend' }));
+
+app.get('/api/sport-types', (req, res) => res.json({ sport_types: SPORT_TYPES }));
+
+// GET /api/classes
+app.get('/api/classes', async (req, res) => {
   try {
     const r = await query(
-      'SELECT id, name, bio, public_fields, credits FROM users WHERE id=$1',
-      [userId]
+      `SELECT c.id, c.name, c.datetime, c.sport_type, c.credit_cost, c.capacity,
+              s.id AS studio_id, s.name AS studio_name, s.location AS studio_location
+         FROM classes c
+         JOIN studios s ON s.id = c.studio_id
+       ORDER BY c.datetime ASC`
     );
-    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
-    const user = r.rows[0];
-    const publicFields = (user.public_fields || 'name').split(',');
-    // Build public profile — only expose fields the user has made public
-    const profile = { id: user.id };
-    if (publicFields.includes('name')) profile.name = user.name;
-    if (publicFields.includes('bio')) profile.bio = user.bio;
-    if (publicFields.includes('credits')) profile.credits = user.credits;
-    res.json({ profile });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// GET /api/users/:userId/settings  — private settings (should be auth-gated in future)
-app.get('/api/users/:userId/settings', async (req, res) => {
-  const userId = Number(req.params.userId);
-  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
-  try {
-    const r = await query(
-      'SELECT id, name, email, bio, public_fields, credits FROM users WHERE id=$1',
-      [userId]
-    );
-    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
-    res.json({ user: r.rows[0] });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// PATCH /api/users/:userId/settings  — update name, bio, public_fields
-app.patch('/api/users/:userId/settings', async (req, res) => {
-  const userId = Number(req.params.userId);
-  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
-  const allowed = ['name', 'bio', 'public_fields'];
-  const fields = [];
-  const values = [];
-  let idx = 1;
-  for (const [k, v] of Object.entries(req.body || {})) {
-    if (allowed.includes(k)) {
-      fields.push(`${k} = $${idx++}`);
-      values.push(v);
-    }
-  }
-  if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
-  try {
-    const r = await query(
-      `UPDATE users SET ${fields.join(', ')} WHERE id=$${idx} RETURNING id, name, email, bio, public_fields, credits`,
-      [...values, userId]
-    );
-    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
-    res.json({ user: r.rows[0] });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// PATCH /api/users/:userId/password  — change password
-app.patch('/api/users/:userId/password', async (req, res) => {
-  const userId = Number(req.params.userId);
-  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
-  const { currentPassword, newPassword } = req.body || {};
-  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'currentPassword and newPassword required' });
-  try {
-    const r = await query('SELECT password FROM users WHERE id=$1', [userId]);
-    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
-    const ok = await bcrypt.compare(currentPassword, r.rows[0].password);
-    if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
-    const hashed = await bcrypt.hash(newPassword, 10);
-    await query('UPDATE users SET password=$1 WHERE id=$2', [hashed, userId]);
-    res.json({ message: 'Password updated successfully' });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// PATCH /api/studios/:studioId/password  — change studio password
-app.patch('/api/studios/:studioId/password', async (req, res) => {
-  const studioId = Number(req.params.studioId);
-  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
-  const { currentPassword, newPassword } = req.body || {};
-  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'currentPassword and newPassword required' });
-  try {
-    const r = await query('SELECT password FROM studios WHERE id=$1', [studioId]);
-    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
-    const ok = await bcrypt.compare(currentPassword, r.rows[0].password);
-    if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
-    const hashed = await bcrypt.hash(newPassword, 10);
-    await query('UPDATE studios SET password=$1 WHERE id=$2', [hashed, studioId]);
-    res.json({ message: 'Password updated successfully' });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// TEMP: debug bcrypt for Alice
-app.get('/api/debug-bcrypt-alice', async (req, res) => {
-  try {
-    const { rows } = await query("SELECT password FROM users WHERE lower(email)='alice@example.com'");
-    const hash = rows?.[0]?.password || '';
-    const ok = await require('bcryptjs').compare('secret123', hash);
-    res.json({ haveHash: !!hash, hashPrefix: hash.slice(0,7), ok });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'debug failed' });
-  }
-});
-
-
-
-// SIGNUP: user
-// body: { name, email, password }
-app.post('/api/signup/user', async (req, res) => {
-  const { name, email, password } = req.body || {};
-  if (!name || !email || !password) {
-    return res.status(400).json({ error: 'name, email, and password are required' });
-  }
-
-  try {
-    const exists = await query(
-      'SELECT 1 FROM users WHERE name = $1 OR email = $2',
-      [name, email]
-    );
-    if (exists.rows.length) {
-      return res.status(409).json({ error: 'Name or email already exists' });
-    }
-
-    const hashed = await bcrypt.hash(password, 10);
-    const inserted = await query(
-      'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id',
-      [name, email, hashed]
-    );
-    const id = inserted.rows[0].id;
-
-    res.status(201).json({
-      user: { id, name, email, role: 'user' },
-      message: 'User registered successfully',
-    });
+    res.json({ classes: r.rows });
   } catch (err) {
-    console.error('signup/user error:', err);
+    console.error('classes error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -242,181 +280,6 @@ app.get('/api/studios/:studioId', async (req, res) => {
   }
 });
 
-// PATCH /api/studios/:studioId  — update studio profile (contact info, location)
-app.patch('/api/studios/:studioId', async (req, res) => {
-  const studioId = Number(req.params.studioId);
-  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
-  const allowed = ['about', 'phone', 'website', 'instagram', 'city', 'neighbourhood', 'location'];
-  const fields = [];
-  const values = [];
-  let idx = 1;
-  for (const [k, v] of Object.entries(req.body || {})) {
-    if (allowed.includes(k)) {
-      fields.push(`${k} = $${idx++}`);
-      values.push(v);
-    }
-  }
-  if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
-  try {
-    const r = await query(
-      `UPDATE studios SET ${fields.join(', ')} WHERE id=$${idx} RETURNING id, name, city, neighbourhood, location, about, phone, website, instagram, verified`,
-      [...values, studioId]
-    );
-    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
-    res.json({ studio: r.rows[0] });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// SIGNUP: studio
-// body: { name, email, password, location? }
-app.post('/api/signup/studio', async (req, res) => {
-  const { name, email, password, location } = req.body || {};
-  if (!name || !email || !password) {
-    return res.status(400).json({ error: 'name, email, and password are required' });
-  }
-
-  try {
-    // Optional: one-studio-only guard
-    // const count = await query('SELECT COUNT(*)::int AS c FROM studios');
-    // if (count.rows[0].c >= 1) {
-    //   return res.status(403).json({ error: 'Studio sign-up is closed for MVP' });
-    // }
-
-    const exists = await query(
-      'SELECT 1 FROM studios WHERE name = $1 OR email = $2',
-      [name, email]
-    );
-    if (exists.rows.length) {
-      return res.status(409).json({ error: 'Studio name or email already exists' });
-    }
-
-    const hashed = await bcrypt.hash(password, 10);
-    const inserted = await query(
-      'INSERT INTO studios (name, email, password, location) VALUES ($1, $2, $3, $4) RETURNING id',
-      [name, email, hashed, location || null]
-    );
-    const id = inserted.rows[0].id;
-
-    res.status(201).json({
-      user: { id, name, email, role: 'studio' },
-      message: 'Studio registered successfully',
-    });
-  } catch (err) {
-    console.error('signup/studio error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// LOGIN (email+password for user or studio)
-app.post('/api/login', async (req, res) => {
-  try {
-    let { email, password } = req.body || {};
-    if (typeof email !== 'string' || typeof password !== 'string') {
-      return res.status(400).json({ error: 'email and password are required' });
-    }
-
-    // normalize inputs so casing/whitespace never breaks login
-    email = email.trim().toLowerCase();
-    password = password.trim();
-
-    // Try users (case-insensitive match)
-    let r = await query(
-      'SELECT id, name, email, password FROM users WHERE lower(email) = $1',
-      [email]
-    );
-    if (r.rows.length) {
-      const u = r.rows[0];
-      const ok = await require('bcryptjs').compare(password, u.password);
-      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-      return res.json({ user: { id: u.id, name: u.name, email: u.email, role: 'user' } });
-    }
-
-    // Try studios (case-insensitive match)
-    r = await query(
-      'SELECT id, name, email, password FROM studios WHERE lower(email) = $1',
-      [email]
-    );
-    if (r.rows.length) {
-      const s = r.rows[0];
-      const ok = await require('bcryptjs').compare(password, s.password);
-      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-      return res.json({ user: { id: s.id, name: s.name, email: s.email, role: 'studio' } });
-    }
-
-    return res.status(404).json({ error: 'No account found for this email' });
-  } catch (err) {
-    console.error('[login] error', err);
-    return res.status(500).json({ error: 'Server error' });
-  }
-});
-
-
-// Example classes list (adjust to your needs)
-// GET /api/classes
-app.get('/api/classes', async (req, res) => {
-  try {
-    const r = await query(
-      `SELECT c.id, c.name, c.datetime, c.sport_type, c.credit_cost, c.capacity,
-              s.id AS studio_id, s.name AS studio_name
-         FROM classes c
-         JOIN studios s ON s.id = c.studio_id
-       ORDER BY c.datetime ASC`
-    );
-    res.json({ classes: r.rows });
-  } catch (err) {
-    console.error('classes error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// GET /api/users/:userId/bookings
-app.get('/api/users/:userId/bookings', async (req, res) => {
-  const userId = Number(req.params.userId);
-  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
-  try {
-    const r = await query(
-      `SELECT b.id, b.timestamp, b.payment_status,
-              c.id AS class_id, c.name AS class_name, c.datetime, c.sport_type, c.credit_cost,
-              s.name AS studio_name, s.location AS studio_location
-         FROM bookings b
-         JOIN classes c ON c.id = b.class_id
-         JOIN studios s ON s.id = c.studio_id
-        WHERE b.user_id = $1
-        ORDER BY c.datetime DESC`,
-      [userId]
-    );
-    res.json({ bookings: r.rows });
-  } catch (e) {
-    console.error('user bookings error:', e);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// POST /api/book
-// body: { user_id, class_id }
-app.post('/api/book', async (req, res) => {
-  const { user_id, class_id } = req.body || {};
-  if (!user_id || !class_id) {
-    return res.status(400).json({ error: 'user_id and class_id are required' });
-  }
-  try {
-    await query(
-      'INSERT INTO bookings (user_id, class_id, payment_status) VALUES ($1, $2, $3)',
-      [user_id, class_id, 'paid']
-    );
-    res.status(201).json({ message: 'Booked successfully' });
-  } catch (err) {
-    console.error('book error:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// =====================
-// Studio class manager
-// =====================
-
 // GET /api/studios/:studioId/classes
 app.get('/api/studios/:studioId/classes', async (req, res) => {
   const studioId = Number(req.params.studioId);
@@ -431,100 +294,290 @@ app.get('/api/studios/:studioId/classes', async (req, res) => {
     );
     res.json({ classes: r.rows });
   } catch (e) {
-    console.error('list studio classes error:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// POST /api/studios/:studioId/classes
-// body: { name, datetime, sport_type, credit_cost, capacity }
-app.post('/api/studios/:studioId/classes', async (req, res) => {
-  const studioId = Number(req.params.studioId);
-  const { name, datetime, sport_type, credit_cost, capacity } = req.body || {};
-  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
-  if (!name || !datetime) return res.status(400).json({ error: 'name and datetime are required' });
+// GET /api/users/:userId/profile  — public profile
+app.get('/api/users/:userId/profile', async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  try {
+    const r = await query('SELECT id, name, bio, public_fields, credits FROM users WHERE id=$1', [userId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    const user = r.rows[0];
+    const publicFields = (user.public_fields || 'name').split(',');
+    const profile = { id: user.id };
+    if (publicFields.includes('name')) profile.name = user.name;
+    if (publicFields.includes('bio')) profile.bio = user.bio;
+    if (publicFields.includes('credits')) profile.credits = user.credits;
+    res.json({ profile });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
-  // Basic normalization
-  const creditCost = (Number.isFinite(+credit_cost) && +credit_cost >= 0) ? +credit_cost : 1;
-  const cap = Number.isFinite(+capacity) ? +capacity : null;
+// =====================
+// SIGNUP / LOGIN / LOGOUT
+// =====================
 
+// POST /api/signup/user
+app.post('/api/signup/user', async (req, res) => {
+  const { name, email, password } = req.body || {};
+  if (!name || !email || !password) return res.status(400).json({ error: 'name, email, and password are required' });
+  try {
+    const exists = await query('SELECT 1 FROM users WHERE name=$1 OR email=$2', [name, email]);
+    if (exists.rows.length) return res.status(409).json({ error: 'Name or email already exists' });
+    const hashed = await bcrypt.hash(password, 10);
+    const inserted = await query(
+      'INSERT INTO users (name, email, password) VALUES ($1,$2,$3) RETURNING id',
+      [name, email, hashed]
+    );
+    const id = inserted.rows[0].id;
+    const token = signToken({ id, role: 'user', email });
+    setAuthCookie(res, token);
+    res.status(201).json({ user: { id, name, email, role: 'user' }, message: 'User registered successfully' });
+  } catch (err) {
+    console.error('signup/user error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/signup/studio
+app.post('/api/signup/studio', async (req, res) => {
+  const { name, email, password, location } = req.body || {};
+  if (!name || !email || !password) return res.status(400).json({ error: 'name, email, and password are required' });
+  try {
+    const exists = await query('SELECT 1 FROM studios WHERE name=$1 OR email=$2', [name, email]);
+    if (exists.rows.length) return res.status(409).json({ error: 'Studio name or email already exists' });
+    const hashed = await bcrypt.hash(password, 10);
+    const inserted = await query(
+      'INSERT INTO studios (name, email, password, location) VALUES ($1,$2,$3,$4) RETURNING id',
+      [name, email, hashed, location || null]
+    );
+    const id = inserted.rows[0].id;
+    const token = signToken({ id, role: 'studio', email });
+    setAuthCookie(res, token);
+    res.status(201).json({ user: { id, name, email, role: 'studio' }, message: 'Studio registered successfully' });
+  } catch (err) {
+    console.error('signup/studio error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/login
+app.post('/api/login', loginLimiter, async (req, res) => {
+  try {
+    let { email, password } = req.body || {};
+    if (typeof email !== 'string' || typeof password !== 'string') {
+      return res.status(400).json({ error: 'email and password are required' });
+    }
+    email = email.trim().toLowerCase();
+    password = password.trim();
+
+    // Try users
+    let r = await query('SELECT id, name, email, password FROM users WHERE lower(email)=$1', [email]);
+    if (r.rows.length) {
+      const u = r.rows[0];
+      const ok = await bcrypt.compare(password, u.password);
+      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+      const token = signToken({ id: u.id, role: 'user', email: u.email });
+      setAuthCookie(res, token);
+      return res.json({ user: { id: u.id, name: u.name, email: u.email, role: 'user' } });
+    }
+
+    // Try studios
+    r = await query('SELECT id, name, email, password FROM studios WHERE lower(email)=$1', [email]);
+    if (r.rows.length) {
+      const s = r.rows[0];
+      const ok = await bcrypt.compare(password, s.password);
+      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+      const token = signToken({ id: s.id, role: 'studio', email: s.email });
+      setAuthCookie(res, token);
+      return res.json({ user: { id: s.id, name: s.name, email: s.email, role: 'studio' } });
+    }
+
+    return res.status(404).json({ error: 'No account found for this email' });
+  } catch (err) {
+    console.error('[login] error', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/logout
+app.post('/api/logout', (req, res) => {
+  res.clearCookie('fitflex_token', {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',
+  });
+  res.json({ ok: true });
+});
+
+// =====================
+// USER PROTECTED ROUTES
+// =====================
+
+// GET /api/users/:userId/bookings
+app.get('/api/users/:userId/bookings', requireAuth, async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
   try {
     const r = await query(
-      `INSERT INTO classes (studio_id, name, datetime, sport_type, credit_cost, capacity)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       RETURNING id, name, datetime, sport_type, credit_cost, capacity`,
-      [studioId, name.trim(), new Date(datetime), (sport_type || null), creditCost, cap]
+      `SELECT b.id, b.timestamp, b.payment_status,
+              c.id AS class_id, c.name AS class_name, c.datetime, c.sport_type, c.credit_cost,
+              s.name AS studio_name, s.location AS studio_location
+         FROM bookings b
+         JOIN classes c ON c.id = b.class_id
+         JOIN studios s ON s.id = c.studio_id
+        WHERE b.user_id=$1
+        ORDER BY c.datetime DESC`,
+      [userId]
     );
-    res.status(201).json({ class: r.rows[0] });
+    res.json({ bookings: r.rows });
   } catch (e) {
-    console.error('create class error:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// PATCH /api/classes/:classId
-// body: any of { name, datetime, sport_type, credit_cost, capacity }
-app.patch('/api/classes/:classId', async (req, res) => {
-  const classId = Number(req.params.classId);
-  if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
+// GET /api/users/:userId/settings
+app.get('/api/users/:userId/settings', requireAuth, async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  try {
+    const r = await query('SELECT id, name, email, bio, public_fields, credits FROM users WHERE id=$1', [userId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ user: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
-  const fields = [];
-  const values = [];
+// PATCH /api/users/:userId/settings
+app.patch('/api/users/:userId/settings', requireAuth, async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  const allowed = ['name', 'bio', 'public_fields'];
+  const fields = [], values = [];
   let idx = 1;
   for (const [k, v] of Object.entries(req.body || {})) {
-    if (['name','datetime','sport_type','credit_cost','capacity'].includes(k)) {
-      fields.push(`${k} = $${idx++}`);
-      values.push(k === 'datetime' ? new Date(v) : v);
-    }
+    if (allowed.includes(k)) { fields.push(`${k}=$${idx++}`); values.push(v); }
   }
   if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
-
   try {
     const r = await query(
-      `UPDATE classes SET ${fields.join(', ')} WHERE id = $${idx} RETURNING id, name, datetime, sport_type, credit_cost, capacity`,
-      [...values, classId]
+      `UPDATE users SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,email,bio,public_fields,credits`,
+      [...values, userId]
     );
-    if (!r.rows.length) return res.status(404).json({ error: 'Class not found' });
-    res.json({ class: r.rows[0] });
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ user: r.rows[0] });
   } catch (e) {
-    console.error('update class error:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// DELETE /api/classes/:classId
-app.delete('/api/classes/:classId', async (req, res) => {
-  const classId = Number(req.params.classId);
-  if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
+// PATCH /api/users/:userId/password
+app.patch('/api/users/:userId/password', requireAuth, async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'currentPassword and newPassword required' });
   try {
-    // optional: cascade or rely on FK behavior; here we just try to delete
-    const r = await query('DELETE FROM classes WHERE id = $1 RETURNING id', [classId]);
-    if (!r.rows.length) return res.status(404).json({ error: 'Class not found' });
-    res.json({ ok: true });
+    const r = await query('SELECT password FROM users WHERE id=$1', [userId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+    const ok = await bcrypt.compare(currentPassword, r.rows[0].password);
+    if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await query('UPDATE users SET password=$1 WHERE id=$2', [hashed, userId]);
+    res.json({ message: 'Password updated successfully' });
   } catch (e) {
-    console.error('delete class error:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
+// POST /api/book
+app.post('/api/book', requireAuth, async (req, res) => {
+  const { user_id, class_id } = req.body || {};
+  if (!user_id || !class_id) return res.status(400).json({ error: 'user_id and class_id are required' });
+  try {
+    // Check if already booked
+    const already = await query('SELECT 1 FROM bookings WHERE user_id=$1 AND class_id=$2', [user_id, class_id]);
+    if (already.rows.length) return res.status(409).json({ error: 'You have already booked this class' });
 
-const crypto = require('crypto');
+    // Get class + studio info for email
+    const clsRes = await query(
+      `SELECT c.id, c.name, c.datetime, c.credit_cost, c.capacity,
+              s.id AS studio_id, s.name AS studio_name, s.email AS studio_email, s.location
+         FROM classes c JOIN studios s ON s.id = c.studio_id WHERE c.id=$1`,
+      [class_id]
+    );
+    if (!clsRes.rows.length) return res.status(404).json({ error: 'Class not found' });
+    const cls = clsRes.rows[0];
 
-// =====================
-// =====================
-// Booking cancellation
-// =====================
+    // Get user info for email
+    const userRes = await query('SELECT id, name, email, credits FROM users WHERE id=$1', [user_id]);
+    if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
+    const user = userRes.rows[0];
 
-// DELETE /api/bookings/:id  — cancel a booking, refund credit
-app.delete('/api/bookings/:id', async (req, res) => {
+    // Check credits
+    if (user.credits < cls.credit_cost) {
+      return res.status(400).json({ error: `Not enough credits. You have ${user.credits}, class costs ${cls.credit_cost}.` });
+    }
+
+    // Capacity check
+    if (cls.capacity) {
+      const booked = await query('SELECT COUNT(*) AS c FROM bookings WHERE class_id=$1', [class_id]);
+      if (Number(booked.rows[0].c) >= cls.capacity) {
+        return res.status(400).json({ error: 'This class is fully booked' });
+      }
+    }
+
+    // Insert booking + deduct credits in transaction
+    await query('BEGIN', []);
+    const bookingRes = await query(
+      'INSERT INTO bookings (user_id, class_id, payment_status) VALUES ($1,$2,$3) RETURNING id',
+      [user_id, class_id, 'paid']
+    );
+    await query('UPDATE users SET credits=credits-$1 WHERE id=$2', [cls.credit_cost, user_id]);
+    await query('COMMIT', []);
+
+    const bookingId = bookingRes.rows[0].id;
+
+    // Send confirmation emails (non-blocking)
+    sendBookingConfirmation({
+      userEmail: user.email,
+      userName: user.name,
+      studioEmail: cls.studio_email,
+      studioName: cls.studio_name,
+      className: cls.name,
+      datetime: cls.datetime,
+      location: cls.location,
+      creditCost: cls.credit_cost,
+      bookingId,
+    }).catch(err => console.error('[email] booking confirmation failed:', err));
+
+    res.status(201).json({ message: 'Booked successfully' });
+  } catch (err) {
+    await query('ROLLBACK', []).catch(() => {});
+    console.error('book error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/bookings/:id  — cancel + refund
+app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
   const bookingId = Number(req.params.id);
   if (!Number.isInteger(bookingId)) return res.status(400).json({ error: 'Invalid booking id' });
   try {
-    // Get booking + class datetime for validation
     const r = await query(
-      `SELECT b.id, b.user_id, c.datetime, c.credit_cost
-         FROM bookings b JOIN classes c ON c.id = b.class_id
-        WHERE b.id = $1`,
+      `SELECT b.id, b.user_id, c.datetime, c.credit_cost, c.name AS class_name,
+              u.name AS user_name, u.email AS user_email,
+              s.name AS studio_name, s.email AS studio_email
+         FROM bookings b
+         JOIN classes c ON c.id = b.class_id
+         JOIN users u ON u.id = b.user_id
+         JOIN studios s ON s.id = c.studio_id
+        WHERE b.id=$1`,
       [bookingId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Booking not found' });
@@ -532,11 +585,22 @@ app.delete('/api/bookings/:id', async (req, res) => {
     if (new Date(booking.datetime) <= new Date()) {
       return res.status(400).json({ error: 'Cannot cancel a class that has already started or passed' });
     }
-    // Delete booking and refund credits in a transaction
     await query('BEGIN', []);
     await query('DELETE FROM bookings WHERE id=$1', [bookingId]);
-    await query('UPDATE users SET credits = credits + $1 WHERE id=$2', [booking.credit_cost, booking.user_id]);
+    await query('UPDATE users SET credits=credits+$1 WHERE id=$2', [booking.credit_cost, booking.user_id]);
     await query('COMMIT', []);
+
+    // Send cancellation emails (non-blocking)
+    sendCancellationNotice({
+      userEmail: booking.user_email,
+      userName: booking.user_name,
+      studioEmail: booking.studio_email,
+      studioName: booking.studio_name,
+      className: booking.class_name,
+      datetime: booking.datetime,
+      creditCost: booking.credit_cost,
+    }).catch(err => console.error('[email] cancellation notice failed:', err));
+
     res.json({ ok: true, message: 'Booking cancelled and credits refunded' });
   } catch (e) {
     await query('ROLLBACK', []).catch(() => {});
@@ -546,19 +610,123 @@ app.delete('/api/bookings/:id', async (req, res) => {
 });
 
 // =====================
-// Admin endpoints
-// Protected by ADMIN_SECRET header (set ADMIN_SECRET in .env)
+// STUDIO PROTECTED ROUTES
+// =====================
+
+// PATCH /api/studios/:studioId
+app.patch('/api/studios/:studioId', requireAuth, async (req, res) => {
+  const studioId = Number(req.params.studioId);
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  const allowed = ['about', 'phone', 'website', 'instagram', 'city', 'neighbourhood', 'location'];
+  const fields = [], values = [];
+  let idx = 1;
+  for (const [k, v] of Object.entries(req.body || {})) {
+    if (allowed.includes(k)) { fields.push(`${k}=$${idx++}`); values.push(v); }
+  }
+  if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
+  try {
+    const r = await query(
+      `UPDATE studios SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,city,neighbourhood,location,about,phone,website,instagram,verified`,
+      [...values, studioId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
+    res.json({ studio: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/studios/:studioId/password
+app.patch('/api/studios/:studioId/password', requireAuth, async (req, res) => {
+  const studioId = Number(req.params.studioId);
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'currentPassword and newPassword required' });
+  try {
+    const r = await query('SELECT password FROM studios WHERE id=$1', [studioId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
+    const ok = await bcrypt.compare(currentPassword, r.rows[0].password);
+    if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await query('UPDATE studios SET password=$1 WHERE id=$2', [hashed, studioId]);
+    res.json({ message: 'Password updated successfully' });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/studios/:studioId/classes
+app.post('/api/studios/:studioId/classes', requireAuth, async (req, res) => {
+  const studioId = Number(req.params.studioId);
+  const { name, datetime, sport_type, credit_cost, capacity } = req.body || {};
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  if (!name || !datetime) return res.status(400).json({ error: 'name and datetime are required' });
+  const creditCost = (Number.isFinite(+credit_cost) && +credit_cost >= 0) ? +credit_cost : 1;
+  const cap = Number.isFinite(+capacity) ? +capacity : null;
+  try {
+    const r = await query(
+      `INSERT INTO classes (studio_id, name, datetime, sport_type, credit_cost, capacity)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id,name,datetime,sport_type,credit_cost,capacity`,
+      [studioId, name.trim(), new Date(datetime), sport_type || null, creditCost, cap]
+    );
+    res.status(201).json({ class: r.rows[0] });
+  } catch (e) {
+    console.error('create class error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/classes/:classId
+app.patch('/api/classes/:classId', requireAuth, async (req, res) => {
+  const classId = Number(req.params.classId);
+  if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
+  const fields = [], values = [];
+  let idx = 1;
+  for (const [k, v] of Object.entries(req.body || {})) {
+    if (['name','datetime','sport_type','credit_cost','capacity'].includes(k)) {
+      fields.push(`${k}=$${idx++}`);
+      values.push(k === 'datetime' ? new Date(v) : v);
+    }
+  }
+  if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
+  try {
+    const r = await query(
+      `UPDATE classes SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,datetime,sport_type,credit_cost,capacity`,
+      [...values, classId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Class not found' });
+    res.json({ class: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/classes/:classId
+app.delete('/api/classes/:classId', requireAuth, async (req, res) => {
+  const classId = Number(req.params.classId);
+  if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
+  try {
+    const r = await query('DELETE FROM classes WHERE id=$1 RETURNING id', [classId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Class not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
+// ADMIN ENDPOINTS
 // =====================
 
 function requireAdmin(req, res, next) {
   const secret = process.env.ADMIN_SECRET;
   if (!secret || req.headers['x-admin-secret'] !== secret) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(403).json({ error: 'Forbidden' });
   }
   next();
 }
 
-// GET /api/admin/stats
 app.get('/api/admin/stats', requireAdmin, async (req, res) => {
   try {
     const [users, studios, classes, bookings] = await Promise.all([
@@ -578,14 +746,13 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/users
 app.get('/api/admin/users', requireAdmin, async (req, res) => {
   try {
     const r = await query(
       `SELECT u.id, u.name, u.email, u.credits,
               COUNT(b.id)::int AS booking_count
          FROM users u
-         LEFT JOIN bookings b ON b.user_id = u.id
+         LEFT JOIN bookings b ON b.user_id=u.id
         GROUP BY u.id ORDER BY u.id DESC`
     );
     res.json({ users: r.rows });
@@ -594,27 +761,28 @@ app.get('/api/admin/users', requireAdmin, async (req, res) => {
   }
 });
 
-// GET /api/admin/studios
 app.get('/api/admin/studios', requireAdmin, async (req, res) => {
   try {
-    const r = await query('SELECT id, name, email, location FROM studios ORDER BY id DESC');
+    const r = await query(
+      'SELECT id, name, email, city, location, verified FROM studios ORDER BY id DESC'
+    );
     res.json({ studios: r.rows });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// GET /api/admin/bookings
 app.get('/api/admin/bookings', requireAdmin, async (req, res) => {
   try {
     const r = await query(
       `SELECT b.id, b.payment_status, b.timestamp,
               u.name AS user_name, u.email AS user_email,
-              c.name AS class_name, s.name AS studio_name
+              c.name AS class_name, c.datetime,
+              s.name AS studio_name
          FROM bookings b
-         JOIN users u ON u.id = b.user_id
-         JOIN classes c ON c.id = b.class_id
-         JOIN studios s ON s.id = c.studio_id
+         JOIN users u ON u.id=b.user_id
+         JOIN classes c ON c.id=b.class_id
+         JOIN studios s ON s.id=c.studio_id
         ORDER BY b.timestamp DESC`
     );
     res.json({ bookings: r.rows });
@@ -623,7 +791,6 @@ app.get('/api/admin/bookings', requireAdmin, async (req, res) => {
   }
 });
 
-// DELETE /api/admin/users/:id
 app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
   try {
     const r = await query('DELETE FROM users WHERE id=$1 RETURNING id', [req.params.id]);
@@ -634,22 +801,6 @@ app.delete('/api/admin/users/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// PATCH /api/admin/studios/:id/verify
-app.patch('/api/admin/studios/:id/verify', requireAdmin, async (req, res) => {
-  const { verified } = req.body || {};
-  try {
-    const r = await query(
-      'UPDATE studios SET verified=$1 WHERE id=$2 RETURNING id, name, verified',
-      [!!verified, req.params.id]
-    );
-    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
-    res.json({ studio: r.rows[0] });
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// DELETE /api/admin/studios/:id
 app.delete('/api/admin/studios/:id', requireAdmin, async (req, res) => {
   try {
     const r = await query('DELETE FROM studios WHERE id=$1 RETURNING id', [req.params.id]);
@@ -660,40 +811,64 @@ app.delete('/api/admin/studios/:id', requireAdmin, async (req, res) => {
   }
 });
 
-/** POST /auth/request-password-reset
- * Body: { email }
- * - If email exists, generate a token, store its hash + expiry, and (in prod) email the link.
- * - Always return 200 to avoid email enumeration.
- */
-app.post('/auth/request-password-reset', async (req, res) => {
+app.patch('/api/admin/studios/:id/verify', requireAdmin, async (req, res) => {
+  const { verified } = req.body || {};
+  try {
+    const r = await query(
+      'UPDATE studios SET verified=$1 WHERE id=$2 RETURNING id,name,verified',
+      [!!verified, req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
+    res.json({ studio: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
+// PASSWORD RESET
+// =====================
+
+app.post('/auth/request-password-reset', resetLimiter, async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email required' });
-
   try {
-    const user = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    const user = await query('SELECT id, name FROM users WHERE lower(email)=$1', [email.trim().toLowerCase()]);
     if (user.rows.length > 0) {
       const userId = user.rows[0].id;
+      const userName = user.rows[0].name;
       const token = crypto.randomBytes(32).toString('hex');
       const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-      const expires = new Date(Date.now() + 1000 * 60 * 30); // 30 minutes
+      const expires = new Date(Date.now() + 1000 * 60 * 30); // 30 min
 
-      // If using users columns:
-      // await pool.query(
-      //   'UPDATE users SET reset_token_hash=$1, reset_token_expires=$2 WHERE id=$3',
-      //   [tokenHash, expires, userId]
-      // );
-
-      // If using password_resets table (recommended):
-      await pool.query(
-        'INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+      await query(
+        'INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1,$2,$3)',
         [userId, tokenHash, expires]
       );
 
-      // In development, return the reset link so you can click it without email
       const resetLink = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/reset?token=${token}`;
-      return res.json({ message: 'If the email exists, a reset link has been sent.', devResetLink: resetLink });
-    }
 
+      // Send reset email
+      const html = `
+        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
+          <h2 style="color:#2563eb">Reset your password</h2>
+          <p>Hi ${userName}, we received a request to reset your FitFlex password.</p>
+          <p>Click the button below to set a new password. This link expires in 30 minutes.</p>
+          <a href="${resetLink}" style="display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0">
+            Reset Password
+          </a>
+          <p style="color:#888;font-size:13px">If you didn't request this, you can safely ignore this email.</p>
+          <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+          <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
+        </div>`;
+
+      await sendEmail({ to: email, subject: 'Reset your FitFlex password', html });
+
+      // In dev (no email configured), expose the link in the response
+      const resp = { message: 'If the email exists, a reset link has been sent.' };
+      if (!resend) resp.devResetLink = resetLink;
+      return res.json(resp);
+    }
     return res.json({ message: 'If the email exists, a reset link has been sent.' });
   } catch (err) {
     console.error(err);
@@ -701,48 +876,22 @@ app.post('/auth/request-password-reset', async (req, res) => {
   }
 });
 
-/** POST /auth/reset-password
- * Body: { token, newPassword }
- * - Verifies token, expiry; updates password; clears the token entry.
- */
 app.post('/auth/reset-password', async (req, res) => {
   const { token, newPassword } = req.body || {};
   if (!token || !newPassword) return res.status(400).json({ error: 'Token and newPassword required' });
-
   try {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-    // If using users columns:
-    // const found = await pool.query(
-    //   'SELECT id FROM users WHERE reset_token_hash=$1 AND reset_token_expires > NOW()',
-    //   [tokenHash]
-    // );
-
-    // If using password_resets table:
-    const found = await pool.query(
-      `SELECT pr.user_id
-       FROM password_resets pr
-       WHERE pr.token_hash = $1 AND pr.expires_at > NOW()
-       ORDER BY pr.id DESC
-       LIMIT 1`,
+    const found = await query(
+      `SELECT pr.user_id FROM password_resets pr
+       WHERE pr.token_hash=$1 AND pr.expires_at > NOW()
+       ORDER BY pr.id DESC LIMIT 1`,
       [tokenHash]
     );
-
-    if (found.rows.length === 0) {
-      return res.status(400).json({ error: 'Invalid or expired token' });
-    }
-
+    if (found.rows.length === 0) return res.status(400).json({ error: 'Invalid or expired token' });
     const userId = found.rows[0].user_id;
     const hashed = await bcrypt.hash(newPassword, 10);
-
-    await pool.query('UPDATE users SET password=$1 WHERE id=$2', [hashed, userId]);
-
-    // Clear used tokens
-    // For users-column approach:
-    // await pool.query('UPDATE users SET reset_token_hash=NULL, reset_token_expires=NULL WHERE id=$1', [userId]);
-
-    // For password_resets table: delete this token (and optionally all tokens for this user)
-    await pool.query('DELETE FROM password_resets WHERE user_id=$1', [userId]);
-
+    await query('UPDATE users SET password=$1 WHERE id=$2', [hashed, userId]);
+    await query('DELETE FROM password_resets WHERE user_id=$1', [userId]);
     return res.json({ message: 'Password reset successful' });
   } catch (err) {
     console.error(err);
@@ -750,8 +899,9 @@ app.post('/auth/reset-password', async (req, res) => {
   }
 });
 
-
 // ---- Start ----
 app.listen(port, '0.0.0.0', () => {
   console.log(`FitFlex backend running on http://0.0.0.0:${port}`);
+  if (!resend) console.log('[email] No RESEND_API_KEY — emails will be logged to console only');
+  if (!isProd) console.log('[auth] Running in development mode — cookies use SameSite=Lax');
 });
