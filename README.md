@@ -4,24 +4,30 @@ Node.js + Express 5 + PostgreSQL API for the FitFlex fitness marketplace.
 
 ---
 
+## Stack
+
+- Node.js + Express 5
+- PostgreSQL (local via Homebrew, production via Render PostgreSQL)
+- bcryptjs — password hashing
+- jsonwebtoken — JWT auth (httpOnly cookie + Authorization header fallback)
+- Resend — transactional email + .ics calendar attachments
+- Stripe — credit pack payments
+- Twilio — WhatsApp notifications (optional)
+- node-cron — 24h class reminder scheduler
+
+---
+
 ## Folder Structure
 
 ```
 fitflex-backend/
-├── server.js               ← All routes (single file)
+├── server.js               ← All routes in one file
 ├── schema/
 │   └── fitflex_schema.sql  ← PostgreSQL table definitions
-├── .env                    ← Environment variables (not committed)
+├── .env                    ← Environment variables (never committed)
 ├── package.json
 └── README.md
 ```
-
----
-
-## Prerequisites
-
-- Node.js 18+
-- PostgreSQL 14+ (`brew install postgresql@14`)
 
 ---
 
@@ -37,37 +43,38 @@ npm install
 PORT=3000
 DATABASE_URL=postgresql://<your-mac-username>@localhost:5432/fitflex
 FRONTEND_URL=http://localhost:5173
-ADMIN_SECRET=change-this-to-a-strong-secret
+ADMIN_SECRET=fitflex-admin-2026!
+JWT_SECRET=your-random-secret
+NODE_ENV=development
+
+# Email (leave blank to skip in dev — emails log to console instead)
+RESEND_API_KEY=
+RESEND_FROM_EMAIL=FitFlex <noreply@yourdomain.com>
+
+# Stripe (leave blank to disable payments)
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
+
+# Twilio WhatsApp (leave blank to disable)
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
 ```
 
-**3. Start PostgreSQL**
+**3. Start PostgreSQL and create the DB**
 ```bash
 brew services start postgresql
-```
-
-**4. Create and seed the database**
-```bash
 createdb fitflex
 psql fitflex < schema/fitflex_schema.sql
-
-# Create the password_resets table (if not in schema)
-psql fitflex -c "
-CREATE TABLE IF NOT EXISTS password_resets (
-  id SERIAL PRIMARY KEY,
-  user_id INT REFERENCES users(id) ON DELETE CASCADE,
-  token_hash TEXT NOT NULL,
-  expires_at TIMESTAMPTZ NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);"
 ```
 
-**5. Start the server**
+**4. Start the server**
 ```bash
 node server.js
 # → http://localhost:3000
 ```
 
-**6. Verify it's running**
+**5. Verify**
 ```bash
 curl http://localhost:3000/api/ping
 # → {"ok":true,"message":"pong from backend"}
@@ -75,86 +82,117 @@ curl http://localhost:3000/api/ping
 
 ---
 
+## Auth
+
+- JWT signed on login/signup, stored in **httpOnly cookie** + returned in response body
+- Frontend sends JWT as `Authorization: Bearer <token>` header on all authenticated requests
+- `requireAuth` middleware accepts either cookie or header
+- `POST /api/logout` clears the cookie
+
+---
+
 ## API Endpoints
 
-### Auth
-| Method | Path | Body | Description |
-|--------|------|------|-------------|
-| POST | `/api/signup/user` | `{ name, email, password }` | Register user |
-| POST | `/api/signup/studio` | `{ name, email, password, location? }` | Register studio |
-| POST | `/api/login` | `{ email, password }` | Login (user or studio) |
-| POST | `/auth/request-password-reset` | `{ email }` | Send reset token |
-| POST | `/auth/reset-password` | `{ token, newPassword }` | Apply reset |
-
-All auth responses return `{ user: { id, name, email, role } }`.
-
-### Classes
-| Method | Path | Description |
-|--------|------|-------------|
+### Public
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/api/ping` | Health check |
+| POST | `/api/signup/user` | `{name, email, password}` |
+| POST | `/api/signup/studio` | `{name, email, password, location?}` |
+| POST | `/api/login` | Rate limited 20/15min |
+| POST | `/api/logout` | Clears cookie |
 | GET | `/api/classes` | All classes with studio info |
-| GET | `/api/studios/:studioId/classes` | Classes for a specific studio |
-| POST | `/api/studios/:studioId/classes` | Create a class |
-| PATCH | `/api/classes/:classId` | Update a class |
-| DELETE | `/api/classes/:classId` | Delete a class |
+| GET | `/api/sport-types` | Sport type list |
+| GET | `/api/studios/:id` | Public studio profile |
+| GET | `/api/studios/:id/classes` | Studio's classes |
+| GET | `/api/credit-packs` | Available credit packs |
+| GET | `/api/users/:id/profile` | Public user profile |
+| POST | `/auth/request-password-reset` | Rate limited 5/hr |
+| POST | `/auth/reset-password` | `{token, newPassword}` |
 
-### Bookings
-| Method | Path | Body | Description |
-|--------|------|------|-------------|
-| POST | `/api/book` | `{ user_id, class_id }` | Book a class |
+### User (JWT required)
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/api/book` | Checks credits + capacity, deducts credits |
+| DELETE | `/api/bookings/:id` | Cancel + refund credits |
+| GET | `/api/users/:id/bookings` | Booking history |
+| GET | `/api/users/:id/settings` | Private settings |
+| PATCH | `/api/users/:id/settings` | Update name, bio, phone, public_fields |
+| PATCH | `/api/users/:id/password` | Change password |
+| GET | `/api/users/:id/purchases` | Credit purchase history |
+| POST | `/api/payments/create-session` | Stripe Checkout session |
 
-### Admin
-All admin endpoints require the header `x-admin-secret: <ADMIN_SECRET>`.
+### Studio (JWT required)
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/api/studios/:id/classes` | Create class |
+| PATCH | `/api/classes/:id` | Update class |
+| DELETE | `/api/classes/:id` | Delete class |
+| POST | `/api/classes/:id/message` | Email + notify all booked users |
+| GET | `/api/studios/:id/analytics` | Booking counts per class |
+| PATCH | `/api/studios/:id` | Update profile (incl. accepts_enquiries) |
+| PATCH | `/api/studios/:id/password` | Change password |
+| POST | `/api/studios/:id/enquire` | User sends custom time enquiry |
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/admin/users` | List all users |
-| GET | `/api/admin/studios` | List all studios |
-| GET | `/api/admin/bookings` | List all bookings with user/class/studio info |
-| DELETE | `/api/admin/users/:id` | Delete a user |
-| DELETE | `/api/admin/studios/:id` | Delete a studio |
+### Notifications (JWT required)
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/api/notifications` | Last 50 notifications + unread count |
+| PATCH | `/api/notifications/read-all` | Mark all as read |
+| PATCH | `/api/notifications/:id/read` | Mark one as read |
 
-Example:
-```bash
-curl -H "x-admin-secret: your-secret" http://localhost:3000/api/admin/users
-```
+### Admin (`x-admin-secret` header required)
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/api/admin/stats` | Platform counts |
+| GET | `/api/admin/users` | All users + booking_count |
+| GET | `/api/admin/studios` | All studios |
+| GET | `/api/admin/bookings` | All bookings |
+| DELETE | `/api/admin/users/:id` | Delete user |
+| DELETE | `/api/admin/studios/:id` | Delete studio |
+| PATCH | `/api/admin/studios/:id/verify` | `{verified: true/false}` |
+
+### Stripe Webhook
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/api/payments/webhook` | Raw body; credits added on payment success |
 
 ---
 
-## Inspecting the Database
+## Database Schema
 
-```bash
-psql fitflex                          # open interactive session
-psql fitflex -c "SELECT * FROM users;" # one-liner
-```
-
-Useful queries:
-```sql
-SELECT id, name, email, credits FROM users;
-SELECT id, name, email, location FROM studios;
-SELECT id, name, datetime, sport_type FROM classes ORDER BY datetime;
-SELECT b.id, u.name, c.name FROM bookings b JOIN users u ON u.id=b.user_id JOIN classes c ON c.id=b.class_id;
-```
+| Table | Key columns |
+|-------|-------------|
+| `users` | id, name, email, password, credits(5), bio, public_fields, phone |
+| `studios` | id, name, email, password, location, city, neighbourhood, about, phone, website, instagram, verified, accepts_enquiries |
+| `classes` | id, studio_id, name, datetime, sport_type, credit_cost, capacity |
+| `bookings` | id, user_id, class_id, payment_status, timestamp |
+| `password_resets` | id, user_id, token_hash, expires_at |
+| `credit_purchases` | id, user_id, credits, amount_cents, stripe_session_id, expires_at |
+| `notifications` | id, recipient_type, recipient_id, type, title, body, read |
 
 ---
 
-## Git Workflow
+## Production (Render)
 
-```bash
-git add <files>
-git commit -m "Describe your change"
-git pull origin main
-git push origin main
-```
+**Required env vars:**
+| Variable | Value |
+|----------|-------|
+| `DATABASE_URL` | Render internal PostgreSQL URL |
+| `FRONTEND_URL` | Vercel frontend URL |
+| `ADMIN_SECRET` | Admin dashboard password |
+| `JWT_SECRET` | Random string (`openssl rand -hex 32`) |
+| `NODE_ENV` | `production` |
 
-Render auto-redeploys on push to `main`.
+**Optional (for features):**
+| Variable | Feature |
+|----------|---------|
+| `RESEND_API_KEY` | Email notifications |
+| `RESEND_FROM_EMAIL` | Email sender address |
+| `STRIPE_SECRET_KEY` | Payments |
+| `STRIPE_WEBHOOK_SECRET` | Stripe webhook verification |
+| `TWILIO_ACCOUNT_SID` | WhatsApp |
+| `TWILIO_AUTH_TOKEN` | WhatsApp |
+| `TWILIO_WHATSAPP_FROM` | WhatsApp sender |
 
----
-
-## Deployment (Render)
-
-1. Connect the `fitflex-backend` GitHub repo to a Render Web Service
-2. Build command: `npm install`
-3. Start command: `node server.js`
-4. Set environment variables in Render dashboard: `DATABASE_URL`, `FRONTEND_URL`, `ADMIN_SECRET`, `PORT=10000`
-
-See `../DEPLOY_WORKFLOW.md` for full step-by-step instructions.
+Auto-deploys on push to `main`.
