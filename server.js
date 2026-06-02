@@ -8,6 +8,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const { rateLimit } = require('express-rate-limit');
+const cron = require('node-cron');
 const { Resend } = require('resend');
 const Stripe = require('stripe');
 const twilio = require('twilio');
@@ -734,6 +735,35 @@ app.delete('/api/classes/:classId', requireAuth, async (req, res) => {
 });
 
 // =====================
+// STUDIO ANALYTICS
+// =====================
+
+// GET /api/studios/:studioId/analytics
+app.get('/api/studios/:studioId/analytics', requireAuth, async (req, res) => {
+  const studioId = Number(req.params.studioId);
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  try {
+    const r = await query(
+      `SELECT c.id, c.name, c.datetime, c.credit_cost, c.capacity,
+              COUNT(b.id)::int AS booking_count
+         FROM classes c
+         LEFT JOIN bookings b ON b.class_id = c.id
+        WHERE c.studio_id = $1
+        GROUP BY c.id
+        ORDER BY c.datetime DESC`,
+      [studioId]
+    );
+    const classes = r.rows;
+    const totalBookings = classes.reduce((s, c) => s + c.booking_count, 0);
+    const totalRevenue = classes.reduce((s, c) => s + c.booking_count * c.credit_cost, 0);
+    res.json({ classes, totalBookings, totalRevenue });
+  } catch (e) {
+    console.error('analytics error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
 // STUDIO MESSAGING
 // =====================
 
@@ -1110,6 +1140,59 @@ app.post('/auth/reset-password', async (req, res) => {
     return res.status(500).json({ error: 'Server error' });
   }
 });
+
+// =====================
+// 24H CLASS REMINDER CRON
+// =====================
+
+async function sendClassReminders() {
+  try {
+    const r = await query(
+      `SELECT c.id, c.name, c.datetime, s.name AS studio_name, s.location,
+              u.name AS user_name, u.email AS user_email
+         FROM classes c
+         JOIN studios s ON s.id = c.studio_id
+         JOIN bookings b ON b.class_id = c.id
+         JOIN users u ON u.id = b.user_id
+        WHERE c.datetime BETWEEN NOW() + INTERVAL '23 hours' AND NOW() + INTERVAL '25 hours'`,
+      []
+    );
+    if (!r.rows.length) return;
+    console.log(`[cron] Sending 24h reminders for ${r.rows.length} booking(s)`);
+    await Promise.all(r.rows.map(row => {
+      const friendlyDate = new Date(row.datetime).toLocaleDateString('en-US', {
+        weekday: 'long', month: 'long', day: 'numeric'
+      });
+      const friendlyTime = new Date(row.datetime).toLocaleTimeString('en-US', {
+        hour: '2-digit', minute: '2-digit'
+      });
+      const html = `
+        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
+          <h2 style="color:#2563eb">Class reminder ⏰</h2>
+          <p>Hi ${row.user_name}, your class is tomorrow!</p>
+          <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
+            <p style="margin:0 0 6px"><strong>${row.class_name}</strong></p>
+            <p style="margin:0 0 4px;color:#555">📍 ${row.studio_name}${row.location ? ' · ' + row.location : ''}</p>
+            <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
+            <p style="margin:0;color:#555">🕐 ${friendlyTime}</p>
+          </div>
+          <p style="color:#888;font-size:13px">See you there! If you can no longer make it, please cancel from your dashboard so others can take your spot.</p>
+          <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+          <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
+        </div>`;
+      return sendEmail({
+        to: row.user_email,
+        subject: `Reminder: ${row.class_name} is tomorrow`,
+        html,
+      });
+    }));
+  } catch (e) {
+    console.error('[cron] Reminder error:', e);
+  }
+}
+
+// Run every hour at :00
+cron.schedule('0 * * * *', sendClassReminders);
 
 // ---- Start ----
 app.listen(port, '0.0.0.0', () => {
