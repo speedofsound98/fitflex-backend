@@ -289,7 +289,7 @@ app.get('/api/studios/:studioId', async (req, res) => {
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
   try {
     const r = await query(
-      'SELECT id, name, city, neighbourhood, location, about, phone, website, instagram, verified FROM studios WHERE id=$1',
+      'SELECT id, name, city, neighbourhood, location, about, phone, website, instagram, verified, accepts_enquiries FROM studios WHERE id=$1',
       [studioId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
@@ -562,6 +562,15 @@ app.post('/api/book', requireAuth, async (req, res) => {
 
     const bookingId = bookingRes.rows[0].id;
 
+    // Notify studio of new booking (non-blocking)
+    createNotification({
+      recipientType: 'studio',
+      recipientId: cls.studio_id,
+      type: 'booking',
+      title: `New booking: ${cls.name}`,
+      body: `${user.name} booked a spot in ${cls.name} on ${new Date(cls.datetime).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}.`,
+    });
+
     // Send confirmation emails (non-blocking)
     sendBookingConfirmation({
       userEmail: user.email,
@@ -591,7 +600,7 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
     const r = await query(
       `SELECT b.id, b.user_id, c.datetime, c.credit_cost, c.name AS class_name,
               u.name AS user_name, u.email AS user_email,
-              s.name AS studio_name, s.email AS studio_email
+              s.id AS studio_id, s.name AS studio_name, s.email AS studio_email
          FROM bookings b
          JOIN classes c ON c.id = b.class_id
          JOIN users u ON u.id = b.user_id
@@ -608,6 +617,15 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
     await query('DELETE FROM bookings WHERE id=$1', [bookingId]);
     await query('UPDATE users SET credits=credits+$1 WHERE id=$2', [booking.credit_cost, booking.user_id]);
     await query('COMMIT', []);
+
+    // Notify studio of cancellation (non-blocking)
+    createNotification({
+      recipientType: 'studio',
+      recipientId: booking.studio_id,
+      type: 'cancellation',
+      title: `Cancellation: ${booking.class_name}`,
+      body: `${booking.user_name} cancelled their booking for ${booking.class_name}.`,
+    });
 
     // Send cancellation emails (non-blocking)
     sendCancellationNotice({
@@ -636,7 +654,7 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
 app.patch('/api/studios/:studioId', requireAuth, async (req, res) => {
   const studioId = Number(req.params.studioId);
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
-  const allowed = ['about', 'phone', 'website', 'instagram', 'city', 'neighbourhood', 'location'];
+  const allowed = ['about', 'phone', 'website', 'instagram', 'city', 'neighbourhood', 'location', 'accepts_enquiries'];
   const fields = [], values = [];
   let idx = 1;
   for (const [k, v] of Object.entries(req.body || {})) {
@@ -645,7 +663,7 @@ app.patch('/api/studios/:studioId', requireAuth, async (req, res) => {
   if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
   try {
     const r = await query(
-      `UPDATE studios SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,city,neighbourhood,location,about,phone,website,instagram,verified`,
+      `UPDATE studios SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,city,neighbourhood,location,about,phone,website,instagram,verified,accepts_enquiries`,
       [...values, studioId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
@@ -821,6 +839,15 @@ app.post('/api/classes/:classId/message', requireAuth, async (req, res) => {
     let emailsSent = 0, whatsappSent = 0;
 
     await Promise.all(bookedUsers.map(async user => {
+      // In-app notification
+      await createNotification({
+        recipientType: 'user',
+        recipientId: user.id,
+        type: 'message',
+        title: `Message from ${cls.studio_name}`,
+        body: message.trim().length > 100 ? message.trim().slice(0, 100) + '…' : message.trim(),
+      });
+
       // Email
       await sendEmail({ to: user.email, subject: `Message from ${cls.studio_name}: ${cls.name}`, html });
       emailsSent++;
@@ -956,6 +983,135 @@ app.get('/api/users/:userId/purchases', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
+
+// =====================
+// NOTIFICATIONS
+// =====================
+
+// Helper: create a notification
+async function createNotification({ recipientType, recipientId, type, title, body }) {
+  try {
+    await query(
+      `INSERT INTO notifications (recipient_type, recipient_id, type, title, body)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [recipientType, recipientId, type, title, body]
+    );
+  } catch (e) {
+    console.error('[notification] Failed to create:', e.message);
+  }
+}
+
+// GET /api/notifications  — get notifications for the logged-in user/studio
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  const { id, role } = req.user;
+  const recipientType = role === 'studio' ? 'studio' : 'user';
+  try {
+    const r = await query(
+      `SELECT id, type, title, body, read, created_at
+         FROM notifications
+        WHERE recipient_type=$1 AND recipient_id=$2
+        ORDER BY created_at DESC
+        LIMIT 50`,
+      [recipientType, id]
+    );
+    const unread = r.rows.filter(n => !n.read).length;
+    res.json({ notifications: r.rows, unread });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/notifications/read-all  — mark all as read
+app.patch('/api/notifications/read-all', requireAuth, async (req, res) => {
+  const { id, role } = req.user;
+  const recipientType = role === 'studio' ? 'studio' : 'user';
+  try {
+    await query(
+      `UPDATE notifications SET read=true
+        WHERE recipient_type=$1 AND recipient_id=$2 AND read=false`,
+      [recipientType, id]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/notifications/:id/read  — mark one as read
+app.patch('/api/notifications/:id/read', requireAuth, async (req, res) => {
+  try {
+    await query('UPDATE notifications SET read=true WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
+// STUDIO ENQUIRIES
+// =====================
+
+// GET /api/studios/:studioId — update to include accepts_enquiries
+// (already handled by the existing GET /api/studios/:studioId route — just needs the column in SELECT)
+
+// POST /api/studios/:studioId/enquire  — user sends custom time enquiry to studio
+app.post('/api/studios/:studioId/enquire', requireAuth, async (req, res) => {
+  const studioId = Number(req.params.studioId);
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  const { message } = req.body || {};
+  if (!message || !message.trim()) return res.status(400).json({ error: 'Message is required' });
+
+  const userId = req.user.id;
+  try {
+    // Check studio accepts enquiries
+    const studioRes = await query(
+      'SELECT id, name, accepts_enquiries FROM studios WHERE id=$1', [studioId]
+    );
+    if (!studioRes.rows.length) return res.status(404).json({ error: 'Studio not found' });
+    if (!studioRes.rows[0].accepts_enquiries) {
+      return res.status(400).json({ error: 'This studio is not accepting enquiries' });
+    }
+
+    const userRes = await query('SELECT name, email FROM users WHERE id=$1', [userId]);
+    if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
+    const user = userRes.rows[0];
+    const studio = studioRes.rows[0];
+
+    // Create notification for studio
+    await createNotification({
+      recipientType: 'studio',
+      recipientId: studioId,
+      type: 'enquiry',
+      title: `New enquiry from ${user.name}`,
+      body: message.trim(),
+    });
+
+    // Also send email to studio (non-blocking)
+    sendEmail({
+      to: (await query('SELECT email FROM studios WHERE id=$1', [studioId])).rows[0]?.email,
+      subject: `New enquiry from ${user.name}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
+          <h2 style="color:#2563eb">New Enquiry 💬</h2>
+          <p><strong>${user.name}</strong> (${user.email}) sent you an enquiry:</p>
+          <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
+            <p style="white-space:pre-wrap;margin:0">${message.trim()}</p>
+          </div>
+          <p style="color:#888;font-size:13px">Reply directly to ${user.email}</p>
+          <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+          <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
+        </div>`,
+    }).catch(() => {});
+
+    res.json({ ok: true, message: 'Enquiry sent!' });
+  } catch (e) {
+    console.error('enquiry error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/studios/:studioId — already exists, just needs accepts_enquiries in allowed fields
+// (update the existing PATCH handler's allowed array)
 
 // =====================
 // ADMIN ENDPOINTS

@@ -31,7 +31,8 @@ CREATE TABLE studios (
   website TEXT,
   instagram TEXT,
   verified BOOLEAN DEFAULT FALSE,
-  description TEXT
+  description TEXT,
+  accepts_enquiries BOOLEAN DEFAULT FALSE
 );
 
 -- Classes
@@ -76,3 +77,16 @@ CREATE TABLE IF NOT EXISTS credit_purchases (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_cp_user ON credit_purchases(user_id);
+
+-- In-app notifications
+CREATE TABLE IF NOT EXISTS notifications (
+  id SERIAL PRIMARY KEY,
+  recipient_type TEXT NOT NULL,  -- 'user' or 'studio'
+  recipient_id INT NOT NULL,
+  type TEXT NOT NULL,            -- 'booking', 'cancellation', 'message', 'enquiry'
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  read BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_notif_recipient ON notifications(recipient_type, recipient_id, read);
