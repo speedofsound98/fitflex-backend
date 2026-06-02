@@ -100,9 +100,13 @@ function setAuthCookie(res, token) {
   });
 }
 
-// requireAuth middleware — verifies JWT from cookie
+// requireAuth middleware — verifies JWT from cookie OR Authorization header
 function requireAuth(req, res, next) {
-  const token = req.cookies?.fitflex_token;
+  let token = req.cookies?.fitflex_token;
+  if (!token) {
+    const auth = req.headers.authorization;
+    if (auth && auth.startsWith('Bearer ')) token = auth.slice(7);
+  }
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
@@ -355,7 +359,7 @@ app.post('/api/signup/user', async (req, res) => {
     const id = inserted.rows[0].id;
     const token = signToken({ id, role: 'user', email });
     setAuthCookie(res, token);
-    res.status(201).json({ user: { id, name, email, role: 'user' }, message: 'User registered successfully' });
+    res.status(201).json({ user: { id, name, email, role: 'user' }, token, message: 'User registered successfully' });
   } catch (err) {
     console.error('signup/user error:', err);
     res.status(500).json({ error: 'Server error' });
@@ -377,7 +381,7 @@ app.post('/api/signup/studio', async (req, res) => {
     const id = inserted.rows[0].id;
     const token = signToken({ id, role: 'studio', email });
     setAuthCookie(res, token);
-    res.status(201).json({ user: { id, name, email, role: 'studio' }, message: 'Studio registered successfully' });
+    res.status(201).json({ user: { id, name, email, role: 'studio' }, token, message: 'Studio registered successfully' });
   } catch (err) {
     console.error('signup/studio error:', err);
     res.status(500).json({ error: 'Server error' });
@@ -402,7 +406,7 @@ app.post('/api/login', loginLimiter, async (req, res) => {
       if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
       const token = signToken({ id: u.id, role: 'user', email: u.email });
       setAuthCookie(res, token);
-      return res.json({ user: { id: u.id, name: u.name, email: u.email, role: 'user' } });
+      return res.json({ user: { id: u.id, name: u.name, email: u.email, role: 'user' }, token });
     }
 
     // Try studios
@@ -413,7 +417,7 @@ app.post('/api/login', loginLimiter, async (req, res) => {
       if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
       const token = signToken({ id: s.id, role: 'studio', email: s.email });
       setAuthCookie(res, token);
-      return res.json({ user: { id: s.id, name: s.name, email: s.email, role: 'studio' } });
+      return res.json({ user: { id: s.id, name: s.name, email: s.email, role: 'studio' }, token });
     }
 
     return res.status(404).json({ error: 'No account found for this email' });
