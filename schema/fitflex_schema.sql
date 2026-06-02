@@ -11,7 +11,10 @@ CREATE TABLE users (
   name TEXT NOT NULL,
   email TEXT UNIQUE NOT NULL,
   password TEXT NOT NULL,
-  credits INT DEFAULT 5
+  credits INT DEFAULT 5,
+  bio TEXT,
+  public_fields TEXT DEFAULT 'name',
+  phone TEXT
 );
 
 -- Studios
@@ -61,3 +64,15 @@ CREATE TABLE IF NOT EXISTS password_resets (
 
 CREATE INDEX IF NOT EXISTS idx_pwresets_user ON password_resets(user_id);
 CREATE INDEX IF NOT EXISTS idx_pwresets_expires ON password_resets(expires_at);
+
+-- Credit purchases (Stripe payments)
+CREATE TABLE IF NOT EXISTS credit_purchases (
+  id SERIAL PRIMARY KEY,
+  user_id INT REFERENCES users(id) ON DELETE CASCADE,
+  credits INT NOT NULL,
+  amount_cents INT NOT NULL,
+  stripe_session_id TEXT,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_cp_user ON credit_purchases(user_id);

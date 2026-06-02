@@ -9,6 +9,8 @@ const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const { rateLimit } = require('express-rate-limit');
 const { Resend } = require('resend');
+const Stripe = require('stripe');
+const twilio = require('twilio');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 
@@ -23,6 +25,22 @@ const isProd = process.env.NODE_ENV === 'production';
 // Resend email client (only active when RESEND_API_KEY is set)
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 const FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'FitFlex <noreply@fitflex.app>';
+
+// Stripe (only active when STRIPE_SECRET_KEY is set)
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+// Twilio (only active when TWILIO_ACCOUNT_SID is set)
+const twilioClient = (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN)
+  ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+  : null;
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886'; // Twilio sandbox default
+
+// Credit pack definitions (also used on /pricing page)
+const CREDIT_PACKS = [
+  { id: 'pack_10',  credits: 10,  price_cents: 1500, label: '10 Credits', popular: false },
+  { id: 'pack_25',  credits: 25,  price_cents: 3000, label: '25 Credits', popular: true  },
+  { id: 'pack_50',  credits: 50,  price_cents: 5000, label: '50 Credits', popular: false },
+];
 
 // ---- Middleware ----
 app.use(express.json());
@@ -445,7 +463,7 @@ app.get('/api/users/:userId/settings', requireAuth, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
   try {
-    const r = await query('SELECT id, name, email, bio, public_fields, credits FROM users WHERE id=$1', [userId]);
+    const r = await query('SELECT id, name, email, bio, public_fields, credits, phone FROM users WHERE id=$1', [userId]);
     if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json({ user: r.rows[0] });
   } catch (e) {
@@ -457,7 +475,7 @@ app.get('/api/users/:userId/settings', requireAuth, async (req, res) => {
 app.patch('/api/users/:userId/settings', requireAuth, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
-  const allowed = ['name', 'bio', 'public_fields'];
+  const allowed = ['name', 'bio', 'public_fields', 'phone'];
   const fields = [], values = [];
   let idx = 1;
   for (const [k, v] of Object.entries(req.body || {})) {
@@ -466,7 +484,7 @@ app.patch('/api/users/:userId/settings', requireAuth, async (req, res) => {
   if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
   try {
     const r = await query(
-      `UPDATE users SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,email,bio,public_fields,credits`,
+      `UPDATE users SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,email,bio,public_fields,credits,phone`,
       [...values, userId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
@@ -710,6 +728,200 @@ app.delete('/api/classes/:classId', requireAuth, async (req, res) => {
     const r = await query('DELETE FROM classes WHERE id=$1 RETURNING id', [classId]);
     if (!r.rows.length) return res.status(404).json({ error: 'Class not found' });
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
+// STUDIO MESSAGING
+// =====================
+
+// POST /api/classes/:classId/message  — studio sends a message to all booked users
+app.post('/api/classes/:classId/message', requireAuth, async (req, res) => {
+  const classId = Number(req.params.classId);
+  if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
+  const { message } = req.body || {};
+  if (!message || !message.trim()) return res.status(400).json({ error: 'Message is required' });
+
+  try {
+    // Get class + studio info
+    const clsRes = await query(
+      `SELECT c.id, c.name, c.datetime, s.id AS studio_id, s.name AS studio_name
+         FROM classes c JOIN studios s ON s.id = c.studio_id WHERE c.id=$1`,
+      [classId]
+    );
+    if (!clsRes.rows.length) return res.status(404).json({ error: 'Class not found' });
+    const cls = clsRes.rows[0];
+
+    // Get all booked users (with phone for WhatsApp)
+    const usersRes = await query(
+      `SELECT u.id, u.name, u.email, u.phone
+         FROM bookings b JOIN users u ON u.id = b.user_id
+        WHERE b.class_id=$1`,
+      [classId]
+    );
+    const bookedUsers = usersRes.rows;
+    if (!bookedUsers.length) return res.json({ ok: true, sent: 0, message: 'No users booked for this class' });
+
+    const friendlyDate = new Date(cls.datetime).toLocaleDateString('en-US', {
+      weekday: 'long', month: 'long', day: 'numeric'
+    });
+    const friendlyTime = new Date(cls.datetime).toLocaleTimeString('en-US', {
+      hour: '2-digit', minute: '2-digit'
+    });
+
+    const html = `
+      <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
+        <h2 style="color:#2563eb">Message from ${cls.studio_name} 📣</h2>
+        <p>You have a message regarding your upcoming class:</p>
+        <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
+          <p style="margin:0 0 6px"><strong>${cls.name}</strong></p>
+          <p style="margin:0;color:#555">📅 ${friendlyDate} · ${friendlyTime}</p>
+        </div>
+        <div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin:16px 0">
+          <p style="white-space:pre-wrap;margin:0;color:#1a1a1a">${message.trim()}</p>
+        </div>
+        <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+        <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
+      </div>`;
+
+    const whatsappText = `📣 *${cls.studio_name}* — message for *${cls.name}* (${friendlyDate} ${friendlyTime}):\n\n${message.trim()}`;
+
+    let emailsSent = 0, whatsappSent = 0;
+
+    await Promise.all(bookedUsers.map(async user => {
+      // Email
+      await sendEmail({ to: user.email, subject: `Message from ${cls.studio_name}: ${cls.name}`, html });
+      emailsSent++;
+
+      // WhatsApp (only if user has phone + Twilio configured)
+      if (twilioClient && user.phone) {
+        const e164 = user.phone.replace(/\s+/g, '').replace(/^00/, '+');
+        try {
+          await twilioClient.messages.create({
+            from: TWILIO_WHATSAPP_FROM,
+            to: `whatsapp:${e164}`,
+            body: whatsappText,
+          });
+          whatsappSent++;
+        } catch (err) {
+          console.error(`[whatsapp] Failed for ${user.phone}:`, err.message);
+        }
+      }
+    }));
+
+    res.json({ ok: true, sent: bookedUsers.length, emailsSent, whatsappSent });
+  } catch (e) {
+    console.error('class message error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
+// STRIPE PAYMENTS
+// =====================
+
+// GET /api/credit-packs  — list available packs (public)
+app.get('/api/credit-packs', (req, res) => {
+  res.json({ packs: CREDIT_PACKS });
+});
+
+// POST /api/payments/create-session  — create Stripe Checkout session
+app.post('/api/payments/create-session', requireAuth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Payments not configured' });
+  const { pack_id, user_id } = req.body || {};
+  const pack = CREDIT_PACKS.find(p => p.id === pack_id);
+  if (!pack) return res.status(400).json({ error: 'Invalid credit pack' });
+
+  // Verify user exists
+  const userRes = await query('SELECT id, email FROM users WHERE id=$1', [user_id]);
+  if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: `FitFlex ${pack.label}`,
+            description: `${pack.credits} credits · valid for 1 year`,
+          },
+          unit_amount: pack.price_cents,
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${process.env.FRONTEND_URL}/dashboard?payment=success`,
+      cancel_url: `${process.env.FRONTEND_URL}/pricing?payment=cancelled`,
+      metadata: {
+        user_id: String(user_id),
+        pack_id: pack.id,
+        credits: String(pack.credits),
+      },
+    });
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error('Stripe session error:', e);
+    res.status(500).json({ error: 'Payment session failed' });
+  }
+});
+
+// POST /api/payments/webhook  — Stripe webhook (raw body required)
+app.post('/api/payments/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    if (!stripe) return res.status(503).send('Not configured');
+    const sig = req.headers['stripe-signature'];
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      console.error('Webhook signature error:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      if (session.payment_status === 'paid') {
+        const userId = Number(session.metadata.user_id);
+        const credits = Number(session.metadata.credits);
+        const packId = session.metadata.pack_id;
+        const pack = CREDIT_PACKS.find(p => p.id === packId);
+        const expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000); // 1 year
+
+        try {
+          await query('BEGIN', []);
+          await query('UPDATE users SET credits=credits+$1 WHERE id=$2', [credits, userId]);
+          await query(
+            `INSERT INTO credit_purchases (user_id, credits, amount_cents, stripe_session_id, expires_at)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [userId, credits, pack ? pack.price_cents : 0, session.id, expiresAt]
+          );
+          await query('COMMIT', []);
+          console.log(`[stripe] +${credits} credits for user ${userId}`);
+        } catch (e) {
+          await query('ROLLBACK', []).catch(() => {});
+          console.error('[stripe] Credit update failed:', e);
+        }
+      }
+    }
+    res.json({ received: true });
+  }
+);
+
+// GET /api/users/:userId/purchases  — credit purchase history
+app.get('/api/users/:userId/purchases', requireAuth, async (req, res) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  try {
+    const r = await query(
+      `SELECT id, credits, amount_cents, expires_at, created_at
+         FROM credit_purchases WHERE user_id=$1 ORDER BY created_at DESC`,
+      [userId]
+    );
+    res.json({ purchases: r.rows });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
