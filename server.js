@@ -511,6 +511,41 @@ app.delete('/api/classes/:classId', async (req, res) => {
 const crypto = require('crypto');
 
 // =====================
+// =====================
+// Booking cancellation
+// =====================
+
+// DELETE /api/bookings/:id  — cancel a booking, refund credit
+app.delete('/api/bookings/:id', async (req, res) => {
+  const bookingId = Number(req.params.id);
+  if (!Number.isInteger(bookingId)) return res.status(400).json({ error: 'Invalid booking id' });
+  try {
+    // Get booking + class datetime for validation
+    const r = await query(
+      `SELECT b.id, b.user_id, c.datetime, c.credit_cost
+         FROM bookings b JOIN classes c ON c.id = b.class_id
+        WHERE b.id = $1`,
+      [bookingId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Booking not found' });
+    const booking = r.rows[0];
+    if (new Date(booking.datetime) <= new Date()) {
+      return res.status(400).json({ error: 'Cannot cancel a class that has already started or passed' });
+    }
+    // Delete booking and refund credits in a transaction
+    await query('BEGIN', []);
+    await query('DELETE FROM bookings WHERE id=$1', [bookingId]);
+    await query('UPDATE users SET credits = credits + $1 WHERE id=$2', [booking.credit_cost, booking.user_id]);
+    await query('COMMIT', []);
+    res.json({ ok: true, message: 'Booking cancelled and credits refunded' });
+  } catch (e) {
+    await query('ROLLBACK', []).catch(() => {});
+    console.error('cancel booking error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
 // Admin endpoints
 // Protected by ADMIN_SECRET header (set ADMIN_SECRET in .env)
 // =====================
@@ -523,10 +558,36 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// GET /api/admin/stats
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+  try {
+    const [users, studios, classes, bookings] = await Promise.all([
+      query('SELECT COUNT(*)::int AS count FROM users'),
+      query('SELECT COUNT(*)::int AS count FROM studios'),
+      query('SELECT COUNT(*)::int AS count FROM classes'),
+      query('SELECT COUNT(*)::int AS count FROM bookings'),
+    ]);
+    res.json({
+      users: users.rows[0].count,
+      studios: studios.rows[0].count,
+      classes: classes.rows[0].count,
+      bookings: bookings.rows[0].count,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // GET /api/admin/users
 app.get('/api/admin/users', requireAdmin, async (req, res) => {
   try {
-    const r = await query('SELECT id, name, email, credits FROM users ORDER BY id DESC');
+    const r = await query(
+      `SELECT u.id, u.name, u.email, u.credits,
+              COUNT(b.id)::int AS booking_count
+         FROM users u
+         LEFT JOIN bookings b ON b.user_id = u.id
+        GROUP BY u.id ORDER BY u.id DESC`
+    );
     res.json({ users: r.rows });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
