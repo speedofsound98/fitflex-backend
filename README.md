@@ -13,7 +13,7 @@ Node.js + Express 5 + PostgreSQL API for the FitFlex fitness marketplace.
 - Resend — transactional email + .ics calendar attachments
 - Stripe — credit pack payments
 - Twilio — WhatsApp notifications (optional)
-- node-cron — 24h class reminder scheduler
+- node-cron — 24h class and event reminder schedulers
 
 ---
 
@@ -84,10 +84,12 @@ curl http://localhost:3000/api/ping
 
 ## Auth
 
-- JWT signed on login/signup, stored in **httpOnly cookie** + returned in response body
-- Frontend sends JWT as `Authorization: Bearer <token>` header on all authenticated requests
-- `requireAuth` middleware accepts either cookie or header
+- JWT signed on login/signup, stored in **httpOnly cookie** and returned in the response body
+- Frontend sends JWT as `Authorization: Bearer <token>` header on authenticated requests
+- `requireAuth` middleware — enforces auth, 401 if missing
+- `optionalAuth` middleware — attaches user if JWT present, continues without error if not
 - `POST /api/logout` clears the cookie
+- Password resets work for both users and studios; studio resets use a negative user_id in the `password_resets` table
 
 ---
 
@@ -105,9 +107,16 @@ curl http://localhost:3000/api/ping
 | GET | `/api/sport-types` | Sport type list |
 | GET | `/api/studios/:id` | Public studio profile |
 | GET | `/api/studios/:id/classes` | Studio's classes |
+| GET | `/api/studios/:id/slots` | Studio's appointment slots |
 | GET | `/api/credit-packs` | Available credit packs |
 | GET | `/api/users/:id/profile` | Public user profile |
-| POST | `/auth/request-password-reset` | Rate limited 5/hr |
+| GET | `/api/groups` | All communities |
+| GET | `/api/groups/:id` | Community detail |
+| GET | `/api/groups/:id/events` | Events in a community |
+| GET | `/api/events/:id` | Single event detail |
+| GET | `/api/groups/:id/posts` | Posts in a community |
+| GET | `/api/posts/:id/comments` | Comments on a post |
+| POST | `/auth/request-password-reset` | Rate limited 5/hr; works for users and studios |
 | POST | `/auth/reset-password` | `{token, newPassword}` |
 
 ### User (JWT required)
@@ -120,7 +129,32 @@ curl http://localhost:3000/api/ping
 | PATCH | `/api/users/:id/settings` | Update name, bio, phone, public_fields |
 | PATCH | `/api/users/:id/password` | Change password |
 | GET | `/api/users/:id/purchases` | Credit purchase history |
+| GET | `/api/users/:id/groups` | Groups the user belongs to |
+| GET | `/api/users/:id/feed` | Activity feed from followed users |
+| POST | `/api/users/:id/follow` | Follow a user |
+| DELETE | `/api/users/:id/follow` | Unfollow a user |
+| GET | `/api/users/:id/following` | Users this user follows |
+| GET | `/api/users/:id/followers` | Users following this user |
+| POST | `/api/slots/:id/book` | Book an appointment slot |
+| DELETE | `/api/slots/:id/book` | Cancel appointment slot booking |
 | POST | `/api/payments/create-session` | Stripe Checkout session |
+| POST | `/api/groups` | Create a community |
+| POST | `/api/groups/:id/join` | Join a community |
+| DELETE | `/api/groups/:id/leave` | Leave a community |
+| DELETE | `/api/groups/:id` | Delete a community (owner only) |
+| PATCH | `/api/groups/:id` | Update community details (owner only) |
+| POST | `/api/groups/:id/events` | Create an event in a community |
+| PATCH | `/api/events/:id` | Update event (creator only) |
+| DELETE | `/api/events/:id` | Delete event (creator only) |
+| POST | `/api/events/:id/rsvp` | RSVP to an event |
+| DELETE | `/api/events/:id/rsvp` | Cancel RSVP |
+| POST | `/api/groups/:id/posts` | Create a post in a community |
+| DELETE | `/api/posts/:id` | Delete a post (author only) |
+| POST | `/api/posts/:id/comments` | Comment on a post |
+| DELETE | `/api/comments/:id` | Delete a comment (author only) |
+| GET | `/api/messages/inbox` | DM inbox (threads with unread counts) |
+| GET | `/api/messages/:type/:partnerId` | Conversation with a user or studio |
+| POST | `/api/messages/:type/:recipientId` | Send a direct message |
 
 ### Studio (JWT required)
 | Method | Path | Notes |
@@ -133,6 +167,9 @@ curl http://localhost:3000/api/ping
 | PATCH | `/api/studios/:id` | Update profile (incl. accepts_enquiries) |
 | PATCH | `/api/studios/:id/password` | Change password |
 | POST | `/api/studios/:id/enquire` | User sends custom time enquiry |
+| POST | `/api/studios/:id/slots` | Create appointment slot |
+| DELETE | `/api/slots/:id` | Delete appointment slot |
+| POST | `/api/groups/:id/broadcast` | Broadcast message to all group members |
 
 ### Notifications (JWT required)
 | Method | Path | Notes |
@@ -140,17 +177,6 @@ curl http://localhost:3000/api/ping
 | GET | `/api/notifications` | Last 50 notifications + unread count |
 | PATCH | `/api/notifications/read-all` | Mark all as read |
 | PATCH | `/api/notifications/:id/read` | Mark one as read |
-
-### Admin (`x-admin-secret` header required)
-| Method | Path | Notes |
-|--------|------|-------|
-| GET | `/api/admin/stats` | Platform counts |
-| GET | `/api/admin/users` | All users + booking_count |
-| GET | `/api/admin/studios` | All studios |
-| GET | `/api/admin/bookings` | All bookings |
-| DELETE | `/api/admin/users/:id` | Delete user |
-| DELETE | `/api/admin/studios/:id` | Delete studio |
-| PATCH | `/api/admin/studios/:id/verify` | `{verified: true/false}` |
 
 ### Stripe Webhook
 | Method | Path | Notes |
@@ -167,9 +193,26 @@ curl http://localhost:3000/api/ping
 | `studios` | id, name, email, password, location, city, neighbourhood, about, phone, website, instagram, verified, accepts_enquiries |
 | `classes` | id, studio_id, name, datetime, sport_type, credit_cost, capacity |
 | `bookings` | id, user_id, class_id, payment_status, timestamp |
-| `password_resets` | id, user_id, token_hash, expires_at |
+| `appointment_slots` | id, studio_id, datetime, duration_minutes, credit_cost, capacity, description |
+| `slot_bookings` | id, slot_id, user_id, created_at |
+| `password_resets` | id, user_id, token_hash, expires_at (negative user_id = studio) |
 | `credit_purchases` | id, user_id, credits, amount_cents, stripe_session_id, expires_at |
 | `notifications` | id, recipient_type, recipient_id, type, title, body, read |
+| `groups` | id, name, description, cover_image_url, creator_id, creator_type, created_at |
+| `group_members` | id, group_id, user_id, joined_at |
+| `group_events` | id, group_id, creator_id, creator_type, title, description, datetime, location |
+| `event_rsvps` | id, event_id, user_id, created_at |
+| `group_posts` | id, group_id, author_id, author_type, content, image_url, created_at |
+| `post_comments` | id, post_id, author_id, author_type, content, created_at |
+| `user_follows` | id, follower_id, following_id, created_at |
+| `direct_messages` | id, sender_type, sender_id, recipient_type, recipient_id, content, read, created_at |
+
+---
+
+## Scheduled Jobs (node-cron)
+
+- **24h class reminder** — runs hourly; emails + WhatsApp users booked into classes starting in ~24h
+- **24h event reminder** — runs hourly; emails users who RSVPed to group events starting in ~24h
 
 ---
 
