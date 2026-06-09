@@ -115,3 +115,28 @@ CREATE TABLE IF NOT EXISTS group_members (
 
 CREATE INDEX IF NOT EXISTS idx_gm_group ON group_members(group_id);
 CREATE INDEX IF NOT EXISTS idx_gm_user ON group_members(user_id);
+
+-- Group events
+CREATE TABLE IF NOT EXISTS group_events (
+  id SERIAL PRIMARY KEY,
+  group_id INT REFERENCES groups(id) ON DELETE CASCADE,
+  creator_id INT REFERENCES users(id) ON DELETE SET NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  datetime TIMESTAMPTZ NOT NULL,
+  location TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS event_rsvps (
+  id SERIAL PRIMARY KEY,
+  event_id INT REFERENCES group_events(id) ON DELETE CASCADE,
+  user_id INT REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK (status IN ('going','maybe','not_going')),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(event_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ge_group ON group_events(group_id);
+CREATE INDEX IF NOT EXISTS idx_er_event ON event_rsvps(event_id);
+CREATE INDEX IF NOT EXISTS idx_er_user ON event_rsvps(user_id);

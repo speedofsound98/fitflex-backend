@@ -989,6 +989,199 @@ app.get('/api/users/:userId/purchases', requireAuth, async (req, res) => {
 });
 
 // =====================
+// GROUP EVENTS
+// =====================
+
+// GET /api/groups/:id/events
+app.get('/api/groups/:id/events', async (req, res) => {
+  const groupId = Number(req.params.id);
+  if (!Number.isInteger(groupId)) return res.status(400).json({ error: 'Invalid group id' });
+  try {
+    const r = await query(
+      `SELECT e.id, e.title, e.description, e.datetime, e.location, e.created_at,
+              u.name AS creator_name,
+              COUNT(CASE WHEN er.status='going' THEN 1 END)::int AS going_count,
+              COUNT(CASE WHEN er.status='maybe' THEN 1 END)::int AS maybe_count
+         FROM group_events e
+         LEFT JOIN users u ON u.id = e.creator_id
+         LEFT JOIN event_rsvps er ON er.event_id = e.id
+        WHERE e.group_id = $1
+        GROUP BY e.id, u.name
+        ORDER BY e.datetime ASC`,
+      [groupId]
+    );
+    res.json({ events: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/events/:id  — event detail + RSVPs
+app.get('/api/events/:id', async (req, res) => {
+  const eventId = Number(req.params.id);
+  if (!Number.isInteger(eventId)) return res.status(400).json({ error: 'Invalid event id' });
+  try {
+    const e = await query(
+      `SELECT ge.*, u.name AS creator_name, g.name AS group_name, g.id AS group_id, g.cover_emoji
+         FROM group_events ge
+         LEFT JOIN users u ON u.id = ge.creator_id
+         JOIN groups g ON g.id = ge.group_id
+        WHERE ge.id = $1`,
+      [eventId]
+    );
+    if (!e.rows.length) return res.status(404).json({ error: 'Event not found' });
+
+    const rsvps = await query(
+      `SELECT er.status, er.user_id, u.name
+         FROM event_rsvps er JOIN users u ON u.id = er.user_id
+        WHERE er.event_id = $1
+        ORDER BY er.created_at ASC`,
+      [eventId]
+    );
+    res.json({ event: e.rows[0], rsvps: rsvps.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/groups/:id/events  — create event (group admin only)
+app.post('/api/groups/:id/events', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const userId = req.user.id;
+  const { title, description, datetime, location } = req.body || {};
+  if (!title || !datetime) return res.status(400).json({ error: 'title and datetime are required' });
+  try {
+    const member = await query(
+      'SELECT role FROM group_members WHERE group_id=$1 AND user_id=$2',
+      [groupId, userId]
+    );
+    if (!member.rows.length || member.rows[0].role !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can create events' });
+    }
+    const r = await query(
+      `INSERT INTO group_events (group_id, creator_id, title, description, datetime, location)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [groupId, userId, title.trim(), description || null, new Date(datetime), location || null]
+    );
+    const event = r.rows[0];
+
+    // Notify all group members
+    const members = await query(
+      'SELECT user_id FROM group_members WHERE group_id=$1 AND user_id!=$2',
+      [groupId, userId]
+    );
+    const groupInfo = await query('SELECT name FROM groups WHERE id=$1', [groupId]);
+    const groupName = groupInfo.rows[0]?.name || 'your group';
+    const friendlyDate = new Date(datetime).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+    const friendlyTime = new Date(datetime).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+    await Promise.all(members.rows.map(m =>
+      createNotification({
+        recipientType: 'user',
+        recipientId: m.user_id,
+        type: 'event',
+        title: `New event in ${groupName}`,
+        body: `${title} — ${friendlyDate} at ${friendlyTime}${location ? ' · ' + location : ''}`,
+      })
+    ));
+
+    res.status(201).json({ event });
+  } catch (e) {
+    console.error('create event error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/events/:id  — update event (admin only)
+app.patch('/api/events/:id', requireAuth, async (req, res) => {
+  const eventId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    // Check if user is admin of the group this event belongs to
+    const check = await query(
+      `SELECT gm.role FROM group_events ge
+         JOIN group_members gm ON gm.group_id = ge.group_id AND gm.user_id = $2
+        WHERE ge.id = $1`,
+      [eventId, userId]
+    );
+    if (!check.rows.length || check.rows[0].role !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can edit events' });
+    }
+    const allowed = ['title', 'description', 'datetime', 'location'];
+    const fields = [], values = [];
+    let idx = 1;
+    for (const [k, v] of Object.entries(req.body || {})) {
+      if (allowed.includes(k)) {
+        fields.push(`${k}=$${idx++}`);
+        values.push(k === 'datetime' ? new Date(v) : v);
+      }
+    }
+    if (!fields.length) return res.status(400).json({ error: 'No valid fields' });
+    const r = await query(
+      `UPDATE group_events SET ${fields.join(',')} WHERE id=$${idx} RETURNING *`,
+      [...values, eventId]
+    );
+    res.json({ event: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/events/:id  — delete event (admin only)
+app.delete('/api/events/:id', requireAuth, async (req, res) => {
+  const eventId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    const check = await query(
+      `SELECT gm.role FROM group_events ge
+         JOIN group_members gm ON gm.group_id = ge.group_id AND gm.user_id = $2
+        WHERE ge.id = $1`,
+      [eventId, userId]
+    );
+    if (!check.rows.length || check.rows[0].role !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can delete events' });
+    }
+    await query('DELETE FROM group_events WHERE id=$1', [eventId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/events/:id/rsvp  — RSVP to an event
+app.post('/api/events/:id/rsvp', requireAuth, async (req, res) => {
+  const eventId = Number(req.params.id);
+  const userId = req.user.id;
+  const { status } = req.body || {};
+  if (!['going', 'maybe', 'not_going'].includes(status)) {
+    return res.status(400).json({ error: 'status must be going, maybe, or not_going' });
+  }
+  try {
+    await query(
+      `INSERT INTO event_rsvps (event_id, user_id, status)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (event_id, user_id) DO UPDATE SET status=$3`,
+      [eventId, userId, status]
+    );
+    res.json({ ok: true, status });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/events/:id/rsvp  — remove RSVP
+app.delete('/api/events/:id/rsvp', requireAuth, async (req, res) => {
+  const eventId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    await query('DELETE FROM event_rsvps WHERE event_id=$1 AND user_id=$2', [eventId, userId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
 // NOTIFICATIONS
 // =====================
 
@@ -1515,6 +1708,45 @@ app.post('/auth/reset-password', async (req, res) => {
 // 24H CLASS REMINDER CRON
 // =====================
 
+async function sendEventReminders() {
+  try {
+    const r = await query(
+      `SELECT ge.id, ge.title, ge.datetime, ge.location,
+              g.name AS group_name,
+              u.name AS user_name, u.email AS user_email
+         FROM group_events ge
+         JOIN groups g ON g.id = ge.group_id
+         JOIN group_members gm ON gm.group_id = ge.group_id
+         JOIN users u ON u.id = gm.user_id
+        WHERE ge.datetime BETWEEN NOW() + INTERVAL '23 hours' AND NOW() + INTERVAL '25 hours'`,
+      []
+    );
+    if (!r.rows.length) return;
+    console.log(`[cron] Sending 24h event reminders for ${r.rows.length} attendee(s)`);
+    await Promise.all(r.rows.map(row => {
+      const friendlyDate = new Date(row.datetime).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+      const friendlyTime = new Date(row.datetime).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+      const html = `
+        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
+          <h2 style="color:#2563eb">Event reminder ⏰</h2>
+          <p>Hi ${row.user_name}, your group event is tomorrow!</p>
+          <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
+            <p style="margin:0 0 6px"><strong>${row.title}</strong></p>
+            <p style="margin:0 0 4px;color:#555">👥 ${row.group_name}</p>
+            <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
+            <p style="margin:0 0 4px;color:#555">🕐 ${friendlyTime}</p>
+            ${row.location ? `<p style="margin:0;color:#555">📍 ${row.location}</p>` : ''}
+          </div>
+          <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+          <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
+        </div>`;
+      return sendEmail({ to: row.user_email, subject: `Reminder: ${row.title} is tomorrow`, html });
+    }));
+  } catch (e) {
+    console.error('[cron] Event reminder error:', e);
+  }
+}
+
 async function sendClassReminders() {
   try {
     const r = await query(
@@ -1562,7 +1794,10 @@ async function sendClassReminders() {
 }
 
 // Run every hour at :00
-cron.schedule('0 * * * *', sendClassReminders);
+cron.schedule('0 * * * *', async () => {
+  await sendClassReminders();
+  await sendEventReminders();
+});
 
 // ---- Start ----
 app.listen(port, '0.0.0.0', () => {
