@@ -32,8 +32,33 @@ CREATE TABLE studios (
   instagram TEXT,
   verified BOOLEAN DEFAULT FALSE,
   description TEXT,
-  accepts_enquiries BOOLEAN DEFAULT FALSE
+  accepts_enquiries BOOLEAN DEFAULT FALSE,
+  offers_appointments BOOLEAN DEFAULT FALSE
 );
+
+-- Appointment slots
+CREATE TABLE IF NOT EXISTS appointment_slots (
+  id SERIAL PRIMARY KEY,
+  studio_id INT REFERENCES studios(id) ON DELETE CASCADE,
+  datetime TIMESTAMPTZ NOT NULL,
+  duration_minutes INT DEFAULT 60,
+  capacity INT DEFAULT 1,
+  credit_cost INT DEFAULT 1,
+  notes TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS slot_bookings (
+  id SERIAL PRIMARY KEY,
+  slot_id INT REFERENCES appointment_slots(id) ON DELETE CASCADE,
+  user_id INT REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(slot_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_slots_studio ON appointment_slots(studio_id, datetime);
+CREATE INDEX IF NOT EXISTS idx_slot_bookings_slot ON slot_bookings(slot_id);
+CREATE INDEX IF NOT EXISTS idx_slot_bookings_user ON slot_bookings(user_id);
 
 -- Classes
 CREATE TABLE classes (
@@ -100,6 +125,7 @@ CREATE TABLE IF NOT EXISTS groups (
   description TEXT,
   cover_emoji TEXT DEFAULT '🏃',
   is_private BOOLEAN DEFAULT FALSE,
+  is_feed_public BOOLEAN DEFAULT FALSE,
   creator_id INT REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -158,5 +184,31 @@ CREATE TABLE IF NOT EXISTS post_comments (
 
 CREATE INDEX IF NOT EXISTS idx_posts_group ON group_posts(group_id);
 CREATE INDEX IF NOT EXISTS idx_comments_post ON post_comments(post_id);
+
+-- Social graph
+CREATE TABLE IF NOT EXISTS user_follows (
+  id SERIAL PRIMARY KEY,
+  follower_id INT REFERENCES users(id) ON DELETE CASCADE,
+  following_id INT REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(follower_id, following_id)
+);
+
+-- Direct messages
+CREATE TABLE IF NOT EXISTS direct_messages (
+  id SERIAL PRIMARY KEY,
+  sender_type TEXT NOT NULL,
+  sender_id INT NOT NULL,
+  recipient_type TEXT NOT NULL,
+  recipient_id INT NOT NULL,
+  content TEXT NOT NULL,
+  read BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_follows_follower ON user_follows(follower_id);
+CREATE INDEX IF NOT EXISTS idx_follows_following ON user_follows(following_id);
+CREATE INDEX IF NOT EXISTS idx_dm_recipient ON direct_messages(recipient_type, recipient_id, read);
+CREATE INDEX IF NOT EXISTS idx_dm_sender ON direct_messages(sender_type, sender_id);
 CREATE INDEX IF NOT EXISTS idx_er_event ON event_rsvps(event_id);
 CREATE INDEX IF NOT EXISTS idx_er_user ON event_rsvps(user_id);

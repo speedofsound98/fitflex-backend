@@ -100,6 +100,17 @@ function setAuthCookie(res, token) {
   });
 }
 
+// optionalAuth — reads JWT if present, returns null if missing/invalid (no blocking)
+function optionalAuth(req) {
+  let token = req.cookies?.fitflex_token;
+  if (!token) {
+    const auth = req.headers.authorization;
+    if (auth && auth.startsWith('Bearer ')) token = auth.slice(7);
+  }
+  if (!token) return null;
+  try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
+}
+
 // requireAuth middleware — verifies JWT from cookie OR Authorization header
 function requireAuth(req, res, next) {
   let token = req.cookies?.fitflex_token;
@@ -293,7 +304,7 @@ app.get('/api/studios/:studioId', async (req, res) => {
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
   try {
     const r = await query(
-      'SELECT id, name, city, neighbourhood, location, about, phone, website, instagram, verified, accepts_enquiries FROM studios WHERE id=$1',
+      'SELECT id, name, city, neighbourhood, location, about, phone, website, instagram, verified, accepts_enquiries, offers_appointments FROM studios WHERE id=$1',
       [studioId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
@@ -658,7 +669,7 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
 app.patch('/api/studios/:studioId', requireAuth, async (req, res) => {
   const studioId = Number(req.params.studioId);
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
-  const allowed = ['about', 'phone', 'website', 'instagram', 'city', 'neighbourhood', 'location', 'accepts_enquiries'];
+  const allowed = ['about', 'phone', 'website', 'instagram', 'city', 'neighbourhood', 'location', 'accepts_enquiries', 'offers_appointments'];
   const fields = [], values = [];
   let idx = 1;
   for (const [k, v] of Object.entries(req.body || {})) {
@@ -667,7 +678,7 @@ app.patch('/api/studios/:studioId', requireAuth, async (req, res) => {
   if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
   try {
     const r = await query(
-      `UPDATE studios SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,city,neighbourhood,location,about,phone,website,instagram,verified,accepts_enquiries`,
+      `UPDATE studios SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,city,neighbourhood,location,about,phone,website,instagram,verified,accepts_enquiries,offers_appointments`,
       [...values, studioId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
@@ -989,6 +1000,149 @@ app.get('/api/users/:userId/purchases', requireAuth, async (req, res) => {
 });
 
 // =====================
+// APPOINTMENT SLOTS
+// =====================
+
+// GET /api/studios/:id/slots?from=ISO&to=ISO  — get slots for a week range
+app.get('/api/studios/:id/slots', async (req, res) => {
+  const studioId = Number(req.params.id);
+  if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  const { from, to, userId } = req.query;
+  try {
+    let sql = `
+      SELECT s.id, s.datetime, s.duration_minutes, s.capacity, s.credit_cost, s.notes,
+             COUNT(sb.id)::int AS booked_count
+        FROM appointment_slots s
+        LEFT JOIN slot_bookings sb ON sb.slot_id = s.id
+       WHERE s.studio_id = $1`;
+    const params = [studioId];
+    let idx = 2;
+    if (from) { sql += ` AND s.datetime >= $${idx++}`; params.push(from); }
+    if (to)   { sql += ` AND s.datetime <= $${idx++}`; params.push(to); }
+    sql += ' GROUP BY s.id ORDER BY s.datetime ASC';
+
+    const r = await query(sql, params);
+
+    // If userId provided, also fetch which slots this user has booked
+    let userBookedSlotIds = new Set();
+    if (userId) {
+      const ub = await query(
+        'SELECT slot_id FROM slot_bookings WHERE user_id=$1',
+        [Number(userId)]
+      );
+      userBookedSlotIds = new Set(ub.rows.map(r => r.slot_id));
+    }
+
+    const slots = r.rows.map(slot => ({
+      ...slot,
+      is_full: slot.booked_count >= slot.capacity,
+      booked_by_user: userBookedSlotIds.has(slot.id),
+    }));
+
+    res.json({ slots });
+  } catch (e) {
+    console.error('get slots error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/studios/:id/slots  — create a slot (studio auth)
+app.post('/api/studios/:id/slots', requireAuth, async (req, res) => {
+  const studioId = Number(req.params.id);
+  const { datetime, duration_minutes, capacity, credit_cost, notes } = req.body || {};
+  if (!datetime) return res.status(400).json({ error: 'datetime is required' });
+  try {
+    const r = await query(
+      `INSERT INTO appointment_slots (studio_id, datetime, duration_minutes, capacity, credit_cost, notes)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING *`,
+      [studioId, new Date(datetime), duration_minutes || 60, capacity || 1, credit_cost ?? 1, notes || null]
+    );
+    res.status(201).json({ slot: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/slots/:id  — delete a slot (studio auth)
+app.delete('/api/slots/:id', requireAuth, async (req, res) => {
+  const slotId = Number(req.params.id);
+  try {
+    await query('DELETE FROM appointment_slots WHERE id=$1', [slotId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/slots/:id/book  — user books a slot
+app.post('/api/slots/:id/book', requireAuth, async (req, res) => {
+  const slotId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    // Check capacity
+    const slot = await query(
+      `SELECT s.*, COUNT(sb.id)::int AS booked_count
+         FROM appointment_slots s
+         LEFT JOIN slot_bookings sb ON sb.slot_id = s.id
+        WHERE s.id=$1 GROUP BY s.id`,
+      [slotId]
+    );
+    if (!slot.rows.length) return res.status(404).json({ error: 'Slot not found' });
+    const s = slot.rows[0];
+    if (s.booked_count >= s.capacity) return res.status(400).json({ error: 'This slot is fully booked' });
+
+    // Check user credits
+    const userRes = await query('SELECT credits FROM users WHERE id=$1', [userId]);
+    if (userRes.rows[0].credits < s.credit_cost) {
+      return res.status(400).json({ error: `Not enough credits. You have ${userRes.rows[0].credits}, slot costs ${s.credit_cost}.` });
+    }
+
+    // Book + deduct credits in transaction
+    await query('BEGIN', []);
+    await query('INSERT INTO slot_bookings (slot_id, user_id) VALUES ($1,$2)', [slotId, userId]);
+    await query('UPDATE users SET credits=credits-$1 WHERE id=$2', [s.credit_cost, userId]);
+    await query('COMMIT', []);
+
+    // Notify studio
+    const studioRes = await query('SELECT id, name FROM studios WHERE id=$1', [s.studio_id]);
+    const userNameRes = await query('SELECT name FROM users WHERE id=$1', [userId]);
+    const friendlyTime = new Date(s.datetime).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    await createNotification({
+      recipientType: 'studio',
+      recipientId: s.studio_id,
+      type: 'booking',
+      title: `Appointment booked: ${friendlyTime}`,
+      body: `${userNameRes.rows[0]?.name} booked a ${s.duration_minutes}min appointment slot.`,
+    });
+
+    res.status(201).json({ ok: true });
+  } catch (e) {
+    await query('ROLLBACK', []).catch(() => {});
+    console.error('book slot error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/slots/:id/book  — user cancels a slot booking
+app.delete('/api/slots/:id/book', requireAuth, async (req, res) => {
+  const slotId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    const slot = await query('SELECT credit_cost FROM appointment_slots WHERE id=$1', [slotId]);
+    if (!slot.rows.length) return res.status(404).json({ error: 'Slot not found' });
+    await query('BEGIN', []);
+    await query('DELETE FROM slot_bookings WHERE slot_id=$1 AND user_id=$2', [slotId, userId]);
+    await query('UPDATE users SET credits=credits+$1 WHERE id=$2', [slot.rows[0].credit_cost, userId]);
+    await query('COMMIT', []);
+    res.json({ ok: true });
+  } catch (e) {
+    await query('ROLLBACK', []).catch(() => {});
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
 // GROUP EVENTS
 // =====================
 
@@ -1190,6 +1344,23 @@ app.get('/api/groups/:id/posts', async (req, res) => {
   const groupId = Number(req.params.id);
   if (!Number.isInteger(groupId)) return res.status(400).json({ error: 'Invalid group id' });
   try {
+    // Check feed visibility
+    const groupRes = await query('SELECT is_feed_public FROM groups WHERE id=$1', [groupId]);
+    if (!groupRes.rows.length) return res.status(404).json({ error: 'Group not found' });
+
+    if (!groupRes.rows[0].is_feed_public) {
+      // Feed is private — must be a member
+      const user = optionalAuth(req);
+      if (!user) return res.status(403).json({ error: 'This group\'s feed is private', feedPrivate: true });
+      const membership = await query(
+        'SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2',
+        [groupId, user.id]
+      );
+      if (!membership.rows.length) {
+        return res.status(403).json({ error: 'Join the group to see the feed', feedPrivate: true });
+      }
+    }
+
     const r = await query(
       `SELECT p.id, p.content, p.created_at,
               u.id AS user_id, u.name AS user_name,
@@ -1507,7 +1678,8 @@ app.get('/api/groups', async (req, res) => {
   const { q, sport_type, city } = req.query;
   try {
     let sql = `
-      SELECT g.id, g.name, g.sport_type, g.city, g.description, g.cover_emoji, g.is_private, g.created_at,
+      SELECT g.id, g.name, g.sport_type, g.city, g.description, g.cover_emoji,
+             g.is_private, g.is_feed_public, g.created_at,
              COUNT(gm.id)::int AS member_count
         FROM groups g
         LEFT JOIN group_members gm ON gm.group_id = g.id
@@ -1532,7 +1704,9 @@ app.get('/api/groups/:id', async (req, res) => {
   if (!Number.isInteger(groupId)) return res.status(400).json({ error: 'Invalid group id' });
   try {
     const g = await query(
-      `SELECT g.*, COUNT(gm.id)::int AS member_count
+      `SELECT g.id, g.name, g.sport_type, g.city, g.description, g.cover_emoji,
+              g.is_private, g.is_feed_public, g.creator_id, g.created_at,
+              COUNT(gm.id)::int AS member_count
          FROM groups g
          LEFT JOIN group_members gm ON gm.group_id = g.id
         WHERE g.id = $1 GROUP BY g.id`,
@@ -1589,7 +1763,7 @@ app.patch('/api/groups/:id', requireAuth, async (req, res) => {
     if (!member.rows.length || member.rows[0].role !== 'admin') {
       return res.status(403).json({ error: 'Only group admins can edit this group' });
     }
-    const allowed = ['name', 'sport_type', 'city', 'description', 'cover_emoji', 'is_private'];
+    const allowed = ['name', 'sport_type', 'city', 'description', 'cover_emoji', 'is_private', 'is_feed_public'];
     const fields = [], values = [];
     let idx = 1;
     for (const [k, v] of Object.entries(req.body || {})) {
