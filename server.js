@@ -1182,6 +1182,194 @@ app.delete('/api/events/:id/rsvp', requireAuth, async (req, res) => {
 });
 
 // =====================
+// GROUP FEED (POSTS + COMMENTS)
+// =====================
+
+// GET /api/groups/:id/posts
+app.get('/api/groups/:id/posts', async (req, res) => {
+  const groupId = Number(req.params.id);
+  if (!Number.isInteger(groupId)) return res.status(400).json({ error: 'Invalid group id' });
+  try {
+    const r = await query(
+      `SELECT p.id, p.content, p.created_at,
+              u.id AS user_id, u.name AS user_name,
+              COUNT(c.id)::int AS comment_count
+         FROM group_posts p
+         JOIN users u ON u.id = p.user_id
+         LEFT JOIN post_comments c ON c.post_id = p.id
+        WHERE p.group_id = $1
+        GROUP BY p.id, u.id
+        ORDER BY p.created_at DESC`,
+      [groupId]
+    );
+    res.json({ posts: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/groups/:id/posts  — create a post (members only)
+app.post('/api/groups/:id/posts', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const userId = req.user.id;
+  const { content } = req.body || {};
+  if (!content || !content.trim()) return res.status(400).json({ error: 'Content is required' });
+  try {
+    // Must be a member
+    const member = await query(
+      'SELECT role FROM group_members WHERE group_id=$1 AND user_id=$2',
+      [groupId, userId]
+    );
+    if (!member.rows.length) return res.status(403).json({ error: 'You must be a member to post' });
+
+    const r = await query(
+      `INSERT INTO group_posts (group_id, user_id, content)
+       VALUES ($1,$2,$3) RETURNING id, content, created_at`,
+      [groupId, userId, content.trim()]
+    );
+    const post = r.rows[0];
+    const userRes = await query('SELECT name FROM users WHERE id=$1', [userId]);
+    const userName = userRes.rows[0]?.name;
+
+    // Notify other members
+    const others = await query(
+      'SELECT user_id FROM group_members WHERE group_id=$1 AND user_id!=$2',
+      [groupId, userId]
+    );
+    const groupRes = await query('SELECT name FROM groups WHERE id=$1', [groupId]);
+    const groupName = groupRes.rows[0]?.name || 'your group';
+    const preview = content.trim().length > 80 ? content.trim().slice(0, 80) + '…' : content.trim();
+
+    await Promise.all(others.rows.map(m =>
+      createNotification({
+        recipientType: 'user',
+        recipientId: m.user_id,
+        type: 'post',
+        title: `${userName} posted in ${groupName}`,
+        body: preview,
+      })
+    ));
+
+    res.status(201).json({ post: { ...post, user_id: userId, user_name: userName, comment_count: 0 } });
+  } catch (e) {
+    console.error('create post error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/posts/:id  — delete post (author or group admin)
+app.delete('/api/posts/:id', requireAuth, async (req, res) => {
+  const postId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    const post = await query(
+      `SELECT p.user_id, p.group_id, gm.role
+         FROM group_posts p
+         LEFT JOIN group_members gm ON gm.group_id = p.group_id AND gm.user_id = $2
+        WHERE p.id = $1`,
+      [postId, userId]
+    );
+    if (!post.rows.length) return res.status(404).json({ error: 'Post not found' });
+    const { user_id, role } = post.rows[0];
+    if (user_id !== userId && role !== 'admin') {
+      return res.status(403).json({ error: 'Not authorised to delete this post' });
+    }
+    await query('DELETE FROM group_posts WHERE id=$1', [postId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/posts/:id/comments
+app.get('/api/posts/:id/comments', async (req, res) => {
+  const postId = Number(req.params.id);
+  if (!Number.isInteger(postId)) return res.status(400).json({ error: 'Invalid post id' });
+  try {
+    const r = await query(
+      `SELECT c.id, c.content, c.created_at, u.id AS user_id, u.name AS user_name
+         FROM post_comments c JOIN users u ON u.id = c.user_id
+        WHERE c.post_id = $1
+        ORDER BY c.created_at ASC`,
+      [postId]
+    );
+    res.json({ comments: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/posts/:id/comments  — add a comment
+app.post('/api/posts/:id/comments', requireAuth, async (req, res) => {
+  const postId = Number(req.params.id);
+  const userId = req.user.id;
+  const { content } = req.body || {};
+  if (!content || !content.trim()) return res.status(400).json({ error: 'Content is required' });
+  try {
+    // Check user is a member of the group this post belongs to
+    const check = await query(
+      `SELECT gm.role FROM group_posts p
+         JOIN group_members gm ON gm.group_id = p.group_id AND gm.user_id = $2
+        WHERE p.id = $1`,
+      [postId, userId]
+    );
+    if (!check.rows.length) return res.status(403).json({ error: 'You must be a group member to comment' });
+
+    const r = await query(
+      `INSERT INTO post_comments (post_id, user_id, content)
+       VALUES ($1,$2,$3) RETURNING id, content, created_at`,
+      [postId, userId, content.trim()]
+    );
+    const userRes = await query('SELECT name FROM users WHERE id=$1', [userId]);
+
+    // Notify the post author (if not the commenter)
+    const postRes = await query('SELECT user_id FROM group_posts WHERE id=$1', [postId]);
+    const postAuthorId = postRes.rows[0]?.user_id;
+    if (postAuthorId && postAuthorId !== userId) {
+      const preview = content.trim().length > 80 ? content.trim().slice(0, 80) + '…' : content.trim();
+      await createNotification({
+        recipientType: 'user',
+        recipientId: postAuthorId,
+        type: 'comment',
+        title: `${userRes.rows[0]?.name} commented on your post`,
+        body: preview,
+      });
+    }
+
+    res.status(201).json({
+      comment: { ...r.rows[0], user_id: userId, user_name: userRes.rows[0]?.name }
+    });
+  } catch (e) {
+    console.error('comment error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/comments/:id  — delete comment (author or admin)
+app.delete('/api/comments/:id', requireAuth, async (req, res) => {
+  const commentId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    const c = await query(
+      `SELECT c.user_id, gm.role
+         FROM post_comments c
+         JOIN group_posts p ON p.id = c.post_id
+         LEFT JOIN group_members gm ON gm.group_id = p.group_id AND gm.user_id = $2
+        WHERE c.id = $1`,
+      [commentId, userId]
+    );
+    if (!c.rows.length) return res.status(404).json({ error: 'Comment not found' });
+    if (c.rows[0].user_id !== userId && c.rows[0].role !== 'admin') {
+      return res.status(403).json({ error: 'Not authorised' });
+    }
+    await query('DELETE FROM post_comments WHERE id=$1', [commentId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
 // NOTIFICATIONS
 // =====================
 

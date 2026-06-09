@@ -138,5 +138,25 @@ CREATE TABLE IF NOT EXISTS event_rsvps (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ge_group ON group_events(group_id);
+
+-- Group feed
+CREATE TABLE IF NOT EXISTS group_posts (
+  id SERIAL PRIMARY KEY,
+  group_id INT REFERENCES groups(id) ON DELETE CASCADE,
+  user_id INT REFERENCES users(id) ON DELETE CASCADE,
+  content TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS post_comments (
+  id SERIAL PRIMARY KEY,
+  post_id INT REFERENCES group_posts(id) ON DELETE CASCADE,
+  user_id INT REFERENCES users(id) ON DELETE CASCADE,
+  content TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_posts_group ON group_posts(group_id);
+CREATE INDEX IF NOT EXISTS idx_comments_post ON post_comments(post_id);
 CREATE INDEX IF NOT EXISTS idx_er_event ON event_rsvps(event_id);
 CREATE INDEX IF NOT EXISTS idx_er_user ON event_rsvps(user_id);
