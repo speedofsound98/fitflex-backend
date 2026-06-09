@@ -90,3 +90,28 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_notif_recipient ON notifications(recipient_type, recipient_id, read);
+
+-- Communities
+CREATE TABLE IF NOT EXISTS groups (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  sport_type TEXT,
+  city TEXT,
+  description TEXT,
+  cover_emoji TEXT DEFAULT '🏃',
+  is_private BOOLEAN DEFAULT FALSE,
+  creator_id INT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS group_members (
+  id SERIAL PRIMARY KEY,
+  group_id INT REFERENCES groups(id) ON DELETE CASCADE,
+  user_id INT REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT DEFAULT 'member',  -- 'admin' or 'member'
+  joined_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(group_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gm_group ON group_members(group_id);
+CREATE INDEX IF NOT EXISTS idx_gm_user ON group_members(user_id);

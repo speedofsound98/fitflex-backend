@@ -1118,6 +1118,184 @@ app.post('/api/studios/:studioId/enquire', requireAuth, async (req, res) => {
 // (update the existing PATCH handler's allowed array)
 
 // =====================
+// COMMUNITIES (GROUPS)
+// =====================
+
+// GET /api/groups  — browse all public groups (with optional search)
+app.get('/api/groups', async (req, res) => {
+  const { q, sport_type, city } = req.query;
+  try {
+    let sql = `
+      SELECT g.id, g.name, g.sport_type, g.city, g.description, g.cover_emoji, g.is_private, g.created_at,
+             COUNT(gm.id)::int AS member_count
+        FROM groups g
+        LEFT JOIN group_members gm ON gm.group_id = g.id
+       WHERE g.is_private = FALSE`;
+    const params = [];
+    let idx = 1;
+    if (q) { sql += ` AND (lower(g.name) LIKE $${idx} OR lower(g.description) LIKE $${idx})`; params.push(`%${q.toLowerCase()}%`); idx++; }
+    if (sport_type) { sql += ` AND lower(g.sport_type) = $${idx}`; params.push(sport_type.toLowerCase()); idx++; }
+    if (city) { sql += ` AND lower(g.city) LIKE $${idx}`; params.push(`%${city.toLowerCase()}%`); idx++; }
+    sql += ' GROUP BY g.id ORDER BY member_count DESC, g.created_at DESC';
+    const r = await query(sql, params);
+    res.json({ groups: r.rows });
+  } catch (e) {
+    console.error('list groups error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/groups/:id  — group profile
+app.get('/api/groups/:id', async (req, res) => {
+  const groupId = Number(req.params.id);
+  if (!Number.isInteger(groupId)) return res.status(400).json({ error: 'Invalid group id' });
+  try {
+    const g = await query(
+      `SELECT g.*, COUNT(gm.id)::int AS member_count
+         FROM groups g
+         LEFT JOIN group_members gm ON gm.group_id = g.id
+        WHERE g.id = $1 GROUP BY g.id`,
+      [groupId]
+    );
+    if (!g.rows.length) return res.status(404).json({ error: 'Group not found' });
+
+    const members = await query(
+      `SELECT u.id, u.name, gm.role, gm.joined_at
+         FROM group_members gm JOIN users u ON u.id = gm.user_id
+        WHERE gm.group_id = $1
+        ORDER BY gm.role DESC, gm.joined_at ASC`,
+      [groupId]
+    );
+    res.json({ group: g.rows[0], members: members.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/groups  — create a group (auth required, creator becomes admin)
+app.post('/api/groups', requireAuth, async (req, res) => {
+  const { name, sport_type, city, description, cover_emoji, is_private } = req.body || {};
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Group name is required' });
+  const userId = req.user.id;
+  try {
+    const r = await query(
+      `INSERT INTO groups (name, sport_type, city, description, cover_emoji, is_private, creator_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [name.trim(), sport_type || null, city || null, description || null, cover_emoji || '🏃', !!is_private, userId]
+    );
+    const group = r.rows[0];
+    // Creator joins as admin
+    await query(
+      'INSERT INTO group_members (group_id, user_id, role) VALUES ($1,$2,$3)',
+      [group.id, userId, 'admin']
+    );
+    res.status(201).json({ group });
+  } catch (e) {
+    console.error('create group error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/groups/:id  — update group (admin only)
+app.patch('/api/groups/:id', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    const member = await query(
+      'SELECT role FROM group_members WHERE group_id=$1 AND user_id=$2',
+      [groupId, userId]
+    );
+    if (!member.rows.length || member.rows[0].role !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can edit this group' });
+    }
+    const allowed = ['name', 'sport_type', 'city', 'description', 'cover_emoji', 'is_private'];
+    const fields = [], values = [];
+    let idx = 1;
+    for (const [k, v] of Object.entries(req.body || {})) {
+      if (allowed.includes(k)) { fields.push(`${k}=$${idx++}`); values.push(v); }
+    }
+    if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
+    const r = await query(
+      `UPDATE groups SET ${fields.join(',')} WHERE id=$${idx} RETURNING *`,
+      [...values, groupId]
+    );
+    res.json({ group: r.rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/groups/:id/join  — join a group
+app.post('/api/groups/:id/join', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    const group = await query('SELECT id, is_private FROM groups WHERE id=$1', [groupId]);
+    if (!group.rows.length) return res.status(404).json({ error: 'Group not found' });
+    if (group.rows[0].is_private) return res.status(403).json({ error: 'This group is private' });
+    await query(
+      'INSERT INTO group_members (group_id, user_id, role) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
+      [groupId, userId, 'member']
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/groups/:id/leave  — leave a group
+app.delete('/api/groups/:id/leave', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    await query('DELETE FROM group_members WHERE group_id=$1 AND user_id=$2', [groupId, userId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/groups/:id  — delete group (admin only)
+app.delete('/api/groups/:id', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const userId = req.user.id;
+  try {
+    const member = await query(
+      'SELECT role FROM group_members WHERE group_id=$1 AND user_id=$2',
+      [groupId, userId]
+    );
+    if (!member.rows.length || member.rows[0].role !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can delete this group' });
+    }
+    await query('DELETE FROM groups WHERE id=$1', [groupId]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/users/:userId/groups  — groups a user belongs to
+app.get('/api/users/:userId/groups', requireAuth, async (req, res) => {
+  const userId = Number(req.params.userId);
+  try {
+    const r = await query(
+      `SELECT g.id, g.name, g.sport_type, g.city, g.cover_emoji, g.is_private, gm.role,
+              COUNT(gm2.id)::int AS member_count
+         FROM group_members gm
+         JOIN groups g ON g.id = gm.group_id
+         LEFT JOIN group_members gm2 ON gm2.group_id = g.id
+        WHERE gm.user_id = $1
+        GROUP BY g.id, gm.role
+        ORDER BY gm.joined_at DESC`,
+      [userId]
+    );
+    res.json({ groups: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
 // ADMIN ENDPOINTS
 // =====================
 
