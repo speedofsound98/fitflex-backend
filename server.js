@@ -1677,6 +1677,281 @@ app.get('/api/users/:userId/groups', requireAuth, async (req, res) => {
 });
 
 // =====================
+// FOLLOWS
+// =====================
+
+// POST /api/users/:id/follow
+app.post('/api/users/:id/follow', requireAuth, async (req, res) => {
+  const followingId = Number(req.params.id);
+  const followerId = req.user.id;
+  if (followerId === followingId) return res.status(400).json({ error: 'Cannot follow yourself' });
+  try {
+    await query(
+      'INSERT INTO user_follows (follower_id, following_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [followerId, followingId]
+    );
+    const target = await query('SELECT name FROM users WHERE id=$1', [followingId]);
+    await createNotification({
+      recipientType: 'user', recipientId: followingId,
+      type: 'follow', title: `${req.user.email} is now following you`,
+      body: 'Someone new is following your activity.',
+    });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// DELETE /api/users/:id/follow
+app.delete('/api/users/:id/follow', requireAuth, async (req, res) => {
+  const followingId = Number(req.params.id);
+  const followerId = req.user.id;
+  try {
+    await query('DELETE FROM user_follows WHERE follower_id=$1 AND following_id=$2', [followerId, followingId]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /api/users/:id/following — who this user follows
+app.get('/api/users/:id/following', requireAuth, async (req, res) => {
+  const userId = Number(req.params.id);
+  try {
+    const r = await query(
+      `SELECT u.id, u.name FROM user_follows uf
+         JOIN users u ON u.id = uf.following_id
+        WHERE uf.follower_id=$1 ORDER BY uf.created_at DESC`,
+      [userId]
+    );
+    res.json({ following: r.rows });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /api/users/:id/followers
+app.get('/api/users/:id/followers', requireAuth, async (req, res) => {
+  const userId = Number(req.params.id);
+  try {
+    const r = await query(
+      `SELECT u.id, u.name FROM user_follows uf
+         JOIN users u ON u.id = uf.follower_id
+        WHERE uf.following_id=$1 ORDER BY uf.created_at DESC`,
+      [userId]
+    );
+    res.json({ followers: r.rows });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /api/users/:id/feed  — activity feed from people you follow
+app.get('/api/users/:id/feed', requireAuth, async (req, res) => {
+  const userId = Number(req.params.id);
+  try {
+    // Bookings (only if user has made bookings public) + group joins from followed users
+    const r = await query(
+      `SELECT 'booking' AS type, u.id AS user_id, u.name AS user_name,
+              c.name AS subject, s.name AS detail, b.timestamp AS created_at
+         FROM user_follows uf
+         JOIN users u ON u.id = uf.following_id
+         JOIN bookings b ON b.user_id = u.id
+         JOIN classes c ON c.id = b.class_id
+         JOIN studios s ON s.id = c.studio_id
+        WHERE uf.follower_id=$1
+          AND u.public_fields LIKE '%bookings%'
+       UNION ALL
+       SELECT 'joined_group' AS type, u.id, u.name,
+              g.name AS subject, g.sport_type AS detail, gm.joined_at AS created_at
+         FROM user_follows uf
+         JOIN users u ON u.id = uf.following_id
+         JOIN group_members gm ON gm.user_id = u.id
+         JOIN groups g ON g.id = gm.group_id
+        WHERE uf.follower_id=$1
+       ORDER BY created_at DESC LIMIT 30`,
+      [userId]
+    );
+    res.json({ feed: r.rows });
+  } catch (e) {
+    console.error('feed error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
+// DIRECT MESSAGES
+// =====================
+
+// GET /api/messages/inbox  — list conversations
+app.get('/api/messages/inbox', requireAuth, async (req, res) => {
+  const { id, role } = req.user;
+  const myType = role === 'studio' ? 'studio' : 'user';
+  try {
+    // Get latest message per conversation partner
+    const r = await query(
+      `SELECT DISTINCT ON (partner_type, partner_id)
+              dm.id, dm.content, dm.read, dm.created_at,
+              dm.sender_type, dm.sender_id,
+              dm.recipient_type, dm.recipient_id,
+              CASE WHEN dm.sender_type=$1 AND dm.sender_id=$2
+                   THEN dm.recipient_type ELSE dm.sender_type END AS partner_type,
+              CASE WHEN dm.sender_type=$1 AND dm.sender_id=$2
+                   THEN dm.recipient_id ELSE dm.sender_id END AS partner_id
+         FROM direct_messages dm
+        WHERE (dm.sender_type=$1 AND dm.sender_id=$2)
+           OR (dm.recipient_type=$1 AND dm.recipient_id=$2)
+        ORDER BY partner_type, partner_id, dm.created_at DESC`,
+      [myType, id]
+    );
+
+    // Enrich with partner names
+    const enriched = await Promise.all(r.rows.map(async row => {
+      let partnerName = 'Unknown';
+      try {
+        if (row.partner_type === 'user') {
+          const u = await query('SELECT name FROM users WHERE id=$1', [row.partner_id]);
+          partnerName = u.rows[0]?.name;
+        } else {
+          const s = await query('SELECT name FROM studios WHERE id=$1', [row.partner_id]);
+          partnerName = s.rows[0]?.name;
+        }
+      } catch { /* ignore */ }
+      return { ...row, partner_name: partnerName };
+    }));
+
+    // Unread count
+    const unread = await query(
+      `SELECT COUNT(*)::int AS count FROM direct_messages
+        WHERE recipient_type=$1 AND recipient_id=$2 AND read=FALSE`,
+      [myType, id]
+    );
+
+    res.json({ conversations: enriched, unread: unread.rows[0].count });
+  } catch (e) {
+    console.error('inbox error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /api/messages/:type/:partnerId  — conversation thread
+app.get('/api/messages/:type/:partnerId', requireAuth, async (req, res) => {
+  const { id, role } = req.user;
+  const myType = role === 'studio' ? 'studio' : 'user';
+  const partnerType = req.params.type;
+  const partnerId = Number(req.params.partnerId);
+  try {
+    const r = await query(
+      `SELECT * FROM direct_messages
+        WHERE (sender_type=$1 AND sender_id=$2 AND recipient_type=$3 AND recipient_id=$4)
+           OR (sender_type=$3 AND sender_id=$4 AND recipient_type=$1 AND recipient_id=$2)
+        ORDER BY created_at ASC`,
+      [myType, id, partnerType, partnerId]
+    );
+    // Mark received messages as read
+    await query(
+      `UPDATE direct_messages SET read=TRUE
+        WHERE recipient_type=$1 AND recipient_id=$2
+          AND sender_type=$3 AND sender_id=$4 AND read=FALSE`,
+      [myType, id, partnerType, partnerId]
+    );
+    res.json({ messages: r.rows });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /api/messages/:type/:recipientId  — send a DM
+app.post('/api/messages/:type/:recipientId', requireAuth, async (req, res) => {
+  const { id, role } = req.user;
+  const myType = role === 'studio' ? 'studio' : 'user';
+  const recipientType = req.params.type;
+  const recipientId = Number(req.params.recipientId);
+  const { content } = req.body || {};
+  if (!content || !content.trim()) return res.status(400).json({ error: 'Message content required' });
+  try {
+    const r = await query(
+      `INSERT INTO direct_messages (sender_type, sender_id, recipient_type, recipient_id, content)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [myType, id, recipientType, recipientId, content.trim()]
+    );
+
+    // Get sender name for notification
+    const senderRes = myType === 'user'
+      ? await query('SELECT name FROM users WHERE id=$1', [id])
+      : await query('SELECT name FROM studios WHERE id=$1', [id]);
+    const senderName = senderRes.rows[0]?.name || 'Someone';
+
+    // Notify recipient
+    await createNotification({
+      recipientType,
+      recipientId,
+      type: 'dm',
+      title: `Message from ${senderName}`,
+      body: content.trim().length > 80 ? content.trim().slice(0, 80) + '…' : content.trim(),
+    });
+
+    res.status(201).json({ message: r.rows[0] });
+  } catch (e) {
+    console.error('send DM error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
+// GROUP BROADCAST MESSAGE
+// =====================
+
+// POST /api/groups/:id/broadcast  — admin sends message to all members
+app.post('/api/groups/:id/broadcast', requireAuth, async (req, res) => {
+  const groupId = Number(req.params.id);
+  const userId = req.user.id;
+  const { content } = req.body || {};
+  if (!content || !content.trim()) return res.status(400).json({ error: 'Message content required' });
+  try {
+    const member = await query(
+      'SELECT role FROM group_members WHERE group_id=$1 AND user_id=$2',
+      [groupId, userId]
+    );
+    if (!member.rows.length || member.rows[0].role !== 'admin') {
+      return res.status(403).json({ error: 'Only group admins can broadcast messages' });
+    }
+
+    const groupRes = await query('SELECT name FROM groups WHERE id=$1', [groupId]);
+    const groupName = groupRes.rows[0]?.name || 'your group';
+    const senderRes = await query('SELECT name, email FROM users WHERE id=$1', [userId]);
+    const senderName = senderRes.rows[0]?.name;
+    const preview = content.trim().length > 80 ? content.trim().slice(0, 80) + '…' : content.trim();
+
+    // Notify + email all members except sender
+    const members = await query(
+      `SELECT u.id, u.name, u.email FROM group_members gm
+         JOIN users u ON u.id = gm.user_id
+        WHERE gm.group_id=$1 AND gm.user_id!=$2`,
+      [groupId, userId]
+    );
+
+    await Promise.all(members.rows.map(async m => {
+      await createNotification({
+        recipientType: 'user', recipientId: m.id,
+        type: 'broadcast',
+        title: `📢 Message from ${groupName}`,
+        body: preview,
+      });
+      await sendEmail({
+        to: m.email,
+        subject: `Message from ${groupName}`,
+        html: `
+          <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
+            <h2 style="color:#2563eb">📢 Message from ${groupName}</h2>
+            <p><strong>${senderName}</strong> sent a message to the group:</p>
+            <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
+              <p style="white-space:pre-wrap;margin:0">${content.trim()}</p>
+            </div>
+            <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+            <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
+          </div>`,
+      });
+    }));
+
+    res.json({ ok: true, sent: members.rows.length });
+  } catch (e) {
+    console.error('broadcast error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
 // ADMIN ENDPOINTS
 // =====================
 
