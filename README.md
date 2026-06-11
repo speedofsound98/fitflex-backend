@@ -164,7 +164,7 @@ curl http://localhost:3000/api/ping
 | DELETE | `/api/classes/:id` | Delete class |
 | POST | `/api/classes/:id/message` | Email + notify all booked users |
 | GET | `/api/studios/:id/analytics` | Booking counts per class |
-| PATCH | `/api/studios/:id` | Update profile (incl. accepts_enquiries) |
+| PATCH | `/api/studios/:id` | Update profile (about, city, neighbourhood, phone, website, instagram, accepts_enquiries, offers_appointments, opening_hour, closing_hour) |
 | PATCH | `/api/studios/:id/password` | Change password |
 | POST | `/api/studios/:id/enquire` | User sends custom time enquiry |
 | POST | `/api/studios/:id/slots` | Create appointment slot |
@@ -190,7 +190,7 @@ curl http://localhost:3000/api/ping
 | Table | Key columns |
 |-------|-------------|
 | `users` | id, name, email, password, credits(5), bio, public_fields, phone |
-| `studios` | id, name, email, password, location, city, neighbourhood, about, phone, website, instagram, verified, accepts_enquiries |
+| `studios` | id, name, email, password, location, city, neighbourhood, about, phone, website, instagram, verified, accepts_enquiries, offers_appointments, opening_hour(9), closing_hour(18) |
 | `classes` | id, studio_id, name, datetime, sport_type, credit_cost, capacity |
 | `bookings` | id, user_id, class_id, payment_status, timestamp |
 | `appointment_slots` | id, studio_id, datetime, duration_minutes, credit_cost, capacity, description |
