@@ -39,6 +39,8 @@ CREATE TABLE studios (
 );
 ALTER TABLE studios ADD COLUMN IF NOT EXISTS opening_hour INT DEFAULT 9;
 ALTER TABLE studios ADD COLUMN IF NOT EXISTS closing_hour INT DEFAULT 18;
+ALTER TABLE studios ADD COLUMN IF NOT EXISTS tagline TEXT;
+ALTER TABLE studios ADD COLUMN IF NOT EXISTS cover_color TEXT DEFAULT 'blue';
 
 -- Appointment slots
 CREATE TABLE IF NOT EXISTS appointment_slots (
