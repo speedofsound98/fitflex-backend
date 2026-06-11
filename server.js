@@ -17,6 +17,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const cloudinary = require('cloudinary').v2;
 
 const app = express();
 
@@ -54,6 +55,14 @@ app.use(cookieParser());
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
 app.use('/uploads', express.static(uploadsDir));
+
+if (process.env.CLOUDINARY_CLOUD_NAME) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+}
 
 const upload = multer({
   dest: uploadsDir,
@@ -725,14 +734,26 @@ app.post('/api/studios/:studioId/cover-photo', requireAuth, upload.single('photo
   if (req.user.id !== studioId || req.user.role !== 'studio') return res.status(403).json({ error: 'Forbidden' });
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-  // Rename to give it the right extension
-  const ext = req.file.mimetype.split('/')[1].replace('jpeg', 'jpg');
-  const newName = `studio-${studioId}-${Date.now()}.${ext}`;
-  const newPath = path.join(uploadsDir, newName);
-  fs.renameSync(req.file.path, newPath);
-
-  const baseUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
-  const photoUrl = `${baseUrl}/uploads/${newName}`;
+  let photoUrl;
+  if (process.env.CLOUDINARY_CLOUD_NAME) {
+    // Production: upload to Cloudinary, then delete temp file
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      folder: 'fitflex/studios',
+      public_id: `studio-${studioId}`,
+      overwrite: true,
+      transformation: [{ width: 1200, height: 400, crop: 'fill', quality: 'auto' }],
+    });
+    fs.unlinkSync(req.file.path);
+    photoUrl = result.secure_url;
+  } else {
+    // Local dev: serve from /uploads
+    const ext = req.file.mimetype.split('/')[1].replace('jpeg', 'jpg');
+    const newName = `studio-${studioId}-${Date.now()}.${ext}`;
+    const newPath = path.join(uploadsDir, newName);
+    fs.renameSync(req.file.path, newPath);
+    const baseUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
+    photoUrl = `${baseUrl}/uploads/${newName}`;
+  }
 
   await query('UPDATE studios SET cover_photo=$1 WHERE id=$2', [photoUrl, studioId]);
   res.json({ url: photoUrl });
