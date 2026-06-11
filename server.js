@@ -304,7 +304,7 @@ app.get('/api/studios/:studioId', async (req, res) => {
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
   try {
     const r = await query(
-      'SELECT id, name, city, neighbourhood, location, about, phone, website, instagram, verified, accepts_enquiries, offers_appointments FROM studios WHERE id=$1',
+      'SELECT id, name, city, neighbourhood, location, about, phone, website, instagram, verified, accepts_enquiries, offers_appointments, opening_hour, closing_hour FROM studios WHERE id=$1',
       [studioId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
@@ -669,7 +669,7 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
 app.patch('/api/studios/:studioId', requireAuth, async (req, res) => {
   const studioId = Number(req.params.studioId);
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
-  const allowed = ['about', 'phone', 'website', 'instagram', 'city', 'neighbourhood', 'location', 'accepts_enquiries', 'offers_appointments'];
+  const allowed = ['about', 'phone', 'website', 'instagram', 'city', 'neighbourhood', 'location', 'accepts_enquiries', 'offers_appointments', 'opening_hour', 'closing_hour'];
   const fields = [], values = [];
   let idx = 1;
   for (const [k, v] of Object.entries(req.body || {})) {
@@ -678,7 +678,7 @@ app.patch('/api/studios/:studioId', requireAuth, async (req, res) => {
   if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
   try {
     const r = await query(
-      `UPDATE studios SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,city,neighbourhood,location,about,phone,website,instagram,verified,accepts_enquiries,offers_appointments`,
+      `UPDATE studios SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,city,neighbourhood,location,about,phone,website,instagram,verified,accepts_enquiries,offers_appointments,opening_hour,closing_hour`,
       [...values, studioId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });

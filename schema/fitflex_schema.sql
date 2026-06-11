@@ -33,8 +33,12 @@ CREATE TABLE studios (
   verified BOOLEAN DEFAULT FALSE,
   description TEXT,
   accepts_enquiries BOOLEAN DEFAULT FALSE,
-  offers_appointments BOOLEAN DEFAULT FALSE
+  offers_appointments BOOLEAN DEFAULT FALSE,
+  opening_hour INT DEFAULT 9,
+  closing_hour INT DEFAULT 18
 );
+ALTER TABLE studios ADD COLUMN IF NOT EXISTS opening_hour INT DEFAULT 9;
+ALTER TABLE studios ADD COLUMN IF NOT EXISTS closing_hour INT DEFAULT 18;
 
 -- Appointment slots
 CREATE TABLE IF NOT EXISTS appointment_slots (
