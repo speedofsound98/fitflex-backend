@@ -298,6 +298,20 @@ app.get('/api/classes', async (req, res) => {
   }
 });
 
+// GET /api/studios  — public list of all studios
+app.get('/api/studios', async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT id, name, city, neighbourhood, location, about, verified, offers_appointments, opening_hour, closing_hour
+         FROM studios
+        ORDER BY verified DESC, name ASC`
+    );
+    res.json({ studios: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // GET /api/studios/:studioId  — public studio profile
 app.get('/api/studios/:studioId', async (req, res) => {
   const studioId = Number(req.params.studioId);
