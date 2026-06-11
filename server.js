@@ -14,6 +14,9 @@ const Stripe = require('stripe');
 const twilio = require('twilio');
 const { Pool } = require('pg');
 const crypto = require('crypto');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 
@@ -46,6 +49,20 @@ const CREDIT_PACKS = [
 // ---- Middleware ----
 app.use(express.json());
 app.use(cookieParser());
+
+// ---- File uploads ----
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+app.use('/uploads', express.static(uploadsDir));
+
+const upload = multer({
+  dest: uploadsDir,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  fileFilter(req, file, cb) {
+    if (/^image\/(jpeg|png|webp|gif)$/.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Only image files are allowed'));
+  },
+});
 
 // CORS: allow local dev + production Vercel frontend
 const allowedOrigins = [
@@ -700,6 +717,25 @@ app.patch('/api/studios/:studioId', requireAuth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+// POST /api/studios/:studioId/cover-photo — upload cover image
+app.post('/api/studios/:studioId/cover-photo', requireAuth, upload.single('photo'), async (req, res) => {
+  const studioId = parseInt(req.params.studioId);
+  if (req.user.id !== studioId || req.user.role !== 'studio') return res.status(403).json({ error: 'Forbidden' });
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+  // Rename to give it the right extension
+  const ext = req.file.mimetype.split('/')[1].replace('jpeg', 'jpg');
+  const newName = `studio-${studioId}-${Date.now()}.${ext}`;
+  const newPath = path.join(uploadsDir, newName);
+  fs.renameSync(req.file.path, newPath);
+
+  const baseUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
+  const photoUrl = `${baseUrl}/uploads/${newName}`;
+
+  await query('UPDATE studios SET cover_photo=$1 WHERE id=$2', [photoUrl, studioId]);
+  res.json({ url: photoUrl });
 });
 
 // PATCH /api/studios/:studioId/password
