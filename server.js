@@ -825,6 +825,27 @@ app.patch('/api/classes/:classId', requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/classes/:classId/attendees — studio sees who booked
+app.get('/api/classes/:classId/attendees', requireAuth, async (req, res) => {
+  const classId = Number(req.params.classId);
+  if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
+  try {
+    const cls = await query('SELECT studio_id FROM classes WHERE id=$1', [classId]);
+    if (!cls.rows.length) return res.status(404).json({ error: 'Class not found' });
+    if (req.user.role !== 'studio' || req.user.id !== cls.rows[0].studio_id)
+      return res.status(403).json({ error: 'Forbidden' });
+    const r = await query(
+      `SELECT u.id, u.name, u.email, u.phone, b.id AS booking_id, b.timestamp
+       FROM bookings b JOIN users u ON u.id = b.user_id
+       WHERE b.class_id=$1 ORDER BY b.timestamp ASC`,
+      [classId]
+    );
+    res.json({ attendees: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // DELETE /api/classes/:classId
 app.delete('/api/classes/:classId', requireAuth, async (req, res) => {
   const classId = Number(req.params.classId);
