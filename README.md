@@ -14,6 +14,9 @@ Node.js + Express 5 + PostgreSQL API for the FitFlex fitness marketplace.
 - Stripe — credit pack payments
 - Twilio — WhatsApp notifications (optional)
 - node-cron — 24h class and event reminder schedulers
+- multer — file uploads (cover photos + workout plan parsing)
+- cloudinary — CDN storage for studio cover photos in production
+- exceljs — Excel/CSV parsing with cell-level color extraction
 
 ---
 
@@ -162,14 +165,17 @@ curl http://localhost:3000/api/ping
 | POST | `/api/studios/:id/classes` | Create class |
 | PATCH | `/api/classes/:id` | Update class |
 | DELETE | `/api/classes/:id` | Delete class |
+| GET | `/api/classes/:id/attendees` | Roster of booked users for a class |
 | POST | `/api/classes/:id/message` | Email + notify all booked users |
 | GET | `/api/studios/:id/analytics` | Booking counts per class |
-| PATCH | `/api/studios/:id` | Update profile (about, city, neighbourhood, phone, website, instagram, accepts_enquiries, offers_appointments, opening_hour, closing_hour) |
+| PATCH | `/api/studios/:id` | Update profile (about, city, neighbourhood, phone, website, instagram, accepts_enquiries, offers_appointments, opening_hour, closing_hour, tagline, cover_color, cover_photo) |
 | PATCH | `/api/studios/:id/password` | Change password |
+| POST | `/api/studios/:id/cover-photo` | Upload cover photo (multer → local dev / Cloudinary in prod) |
 | POST | `/api/studios/:id/enquire` | User sends custom time enquiry |
 | POST | `/api/studios/:id/slots` | Create appointment slot |
 | DELETE | `/api/slots/:id` | Delete appointment slot |
 | POST | `/api/groups/:id/broadcast` | Broadcast message to all group members |
+| POST | `/api/workout-plan/parse` | Parse Excel/CSV; returns sheets with per-cell colors |
 
 ### Notifications (JWT required)
 | Method | Path | Notes |
@@ -190,7 +196,7 @@ curl http://localhost:3000/api/ping
 | Table | Key columns |
 |-------|-------------|
 | `users` | id, name, email, password, credits(5), bio, public_fields, phone |
-| `studios` | id, name, email, password, location, city, neighbourhood, about, phone, website, instagram, verified, accepts_enquiries, offers_appointments, opening_hour(9), closing_hour(18) |
+| `studios` | id, name, email, password, location, city, neighbourhood, about, phone, website, instagram, verified, accepts_enquiries, offers_appointments, opening_hour(9), closing_hour(18), tagline, cover_color('blue'), cover_photo |
 | `classes` | id, studio_id, name, datetime, sport_type, credit_cost, capacity |
 | `bookings` | id, user_id, class_id, payment_status, timestamp |
 | `appointment_slots` | id, studio_id, datetime, duration_minutes, credit_cost, capacity, description |
@@ -237,5 +243,9 @@ curl http://localhost:3000/api/ping
 | `TWILIO_ACCOUNT_SID` | WhatsApp |
 | `TWILIO_AUTH_TOKEN` | WhatsApp |
 | `TWILIO_WHATSAPP_FROM` | WhatsApp sender |
+| `CLOUDINARY_CLOUD_NAME` | Studio cover photo CDN (production) |
+| `CLOUDINARY_API_KEY` | Cloudinary |
+| `CLOUDINARY_API_SECRET` | Cloudinary |
+| `BACKEND_URL` | Public backend URL — used to construct local upload URLs in dev (e.g. `http://localhost:3000`) |
 
 Auto-deploys on push to `main`.
