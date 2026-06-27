@@ -2559,6 +2559,7 @@ app.post('/api/workout-plan/parse', requireAuth, planUpload.single('file'), asyn
     const sheets = [];
     wb.eachSheet(ws => {
       const rows = [];
+      let maxCols = 0;
       ws.eachRow({ includeEmpty: false }, (row) => {
         const cells = [];
         let hasContent = false;
@@ -2570,11 +2571,16 @@ app.post('/api/workout-plan/parse', requireAuth, planUpload.single('file'), asyn
           const bg = resolveColor(cell.fill?.fgColor);
           const fg = resolveColor(cell.font?.color);
           const bold = cell.font?.bold || false;
-          cells[colIdx - 1] = { v: text, bg, fg, bold };
+          // fill any gap with empty cells
+          while (cells.length < colIdx - 1) cells.push({ v: '', bg: null, fg: null, bold: false });
+          cells.push({ v: text, bg, fg, bold });
           if (text.trim()) hasContent = true;
+          if (colIdx > maxCols) maxCols = colIdx;
         });
         if (hasContent) rows.push(cells);
       });
+      // Ensure every row has the same length
+      rows.forEach(r => { while (r.length < maxCols) r.push({ v: '', bg: null, fg: null, bold: false }); });
       sheets.push({ name: ws.name, rows });
     });
 
