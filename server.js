@@ -2528,6 +2528,38 @@ cron.schedule('0 * * * *', async () => {
   await sendEventReminders();
 });
 
+// ---- Workout plan parser ----
+const XLSX = require('xlsx');
+
+const planUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter(req, file, cb) {
+    const ok = /\.(xlsx|xls|csv)$/i.test(file.originalname) ||
+      file.mimetype === 'text/csv' ||
+      file.mimetype.includes('spreadsheet') ||
+      file.mimetype.includes('excel');
+    ok ? cb(null, true) : cb(new Error('Only Excel or CSV files are allowed'));
+  },
+});
+
+app.post('/api/workout-plan/parse', requireAuth, planUpload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  try {
+    const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
+    const sheets = wb.SheetNames.map(name => {
+      const ws = wb.Sheets[name];
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+      // Strip completely empty rows
+      const cleaned = rows.filter(r => r.some(c => c !== '' && c !== null && c !== undefined));
+      return { name, rows: cleaned };
+    });
+    res.json({ sheets });
+  } catch (e) {
+    res.status(400).json({ error: 'Could not parse file: ' + e.message });
+  }
+});
+
 // ---- Start ----
 app.listen(port, '0.0.0.0', () => {
   console.log(`FitFlex backend running on http://0.0.0.0:${port}`);
