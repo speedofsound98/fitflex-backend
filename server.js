@@ -2529,7 +2529,7 @@ cron.schedule('0 * * * *', async () => {
 });
 
 // ---- Workout plan parser ----
-const XLSX = require('xlsx');
+const ExcelJS = require('exceljs');
 
 const planUpload = multer({
   storage: multer.memoryStorage(),
@@ -2543,17 +2543,41 @@ const planUpload = multer({
   },
 });
 
-app.post('/api/workout-plan/parse', requireAuth, planUpload.single('file'), (req, res) => {
+function resolveColor(color) {
+  if (!color) return null;
+  if (color.argb && color.argb !== 'FF000000' && color.argb !== '00000000' && color.argb !== 'FFFFFFFF')
+    return '#' + color.argb.slice(2); // strip alpha
+  return null;
+}
+
+app.post('/api/workout-plan/parse', requireAuth, planUpload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   try {
-    const wb = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
-    const sheets = wb.SheetNames.map(name => {
-      const ws = wb.Sheets[name];
-      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-      // Strip completely empty rows
-      const cleaned = rows.filter(r => r.some(c => c !== '' && c !== null && c !== undefined));
-      return { name, rows: cleaned };
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(req.file.buffer);
+
+    const sheets = [];
+    wb.eachSheet(ws => {
+      const rows = [];
+      ws.eachRow({ includeEmpty: false }, (row) => {
+        const cells = [];
+        let hasContent = false;
+        row.eachCell({ includeEmpty: true }, (cell, colIdx) => {
+          const val = cell.type === ExcelJS.ValueType.Formula
+            ? cell.result
+            : cell.value;
+          const text = val === null || val === undefined ? '' : String(val);
+          const bg = resolveColor(cell.fill?.fgColor);
+          const fg = resolveColor(cell.font?.color);
+          const bold = cell.font?.bold || false;
+          cells[colIdx - 1] = { v: text, bg, fg, bold };
+          if (text.trim()) hasContent = true;
+        });
+        if (hasContent) rows.push(cells);
+      });
+      sheets.push({ name: ws.name, rows });
     });
+
     res.json({ sheets });
   } catch (e) {
     res.status(400).json({ error: 'Could not parse file: ' + e.message });
