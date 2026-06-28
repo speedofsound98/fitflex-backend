@@ -2590,6 +2590,40 @@ app.post('/api/workout-plan/parse', requireAuth, planUpload.single('file'), asyn
   }
 });
 
+// ---- Workout Plan Export ----
+app.post('/api/workout-plan/export', requireAuth, async (req, res) => {
+  const { sheets, fileName } = req.body;
+  if (!sheets || !Array.isArray(sheets)) return res.status(400).json({ error: 'Missing sheets data' });
+  try {
+    const wb = new ExcelJS.Workbook();
+    sheets.forEach(sheet => {
+      const ws = wb.addWorksheet(sheet.name || 'Sheet');
+      (sheet.rows || []).forEach((row, ri) => {
+        const wsRow = ws.getRow(ri + 1);
+        (row || []).forEach((cell, ci) => {
+          const wsCell = wsRow.getCell(ci + 1);
+          wsCell.value = cell?.v || null;
+          if (cell?.bg) {
+            wsCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + cell.bg.replace('#', '') } };
+          }
+          const font = {};
+          if (cell?.fg) font.color = { argb: 'FF' + cell.fg.replace('#', '') };
+          if (cell?.bold) font.bold = true;
+          if (Object.keys(font).length) wsCell.font = font;
+        });
+        wsRow.commit();
+      });
+    });
+    const safe = (fileName || 'training-plan').replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.xlsx$/i, '');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${safe}.xlsx"`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (e) {
+    res.status(500).json({ error: 'Export failed: ' + e.message });
+  }
+});
+
 // ---- Start ----
 app.listen(port, '0.0.0.0', () => {
   console.log(`FitFlex backend running on http://0.0.0.0:${port}`);
