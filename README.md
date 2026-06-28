@@ -176,6 +176,7 @@ curl http://localhost:3000/api/ping
 | DELETE | `/api/slots/:id` | Delete appointment slot |
 | POST | `/api/groups/:id/broadcast` | Broadcast message to all group members |
 | POST | `/api/workout-plan/parse` | Parse Excel/CSV; returns sheets with per-cell colors |
+| POST | `/api/workout-plan/export` | Rebuild .xlsx from edited cell data; streams file with colors + bold preserved |
 
 ### Notifications (JWT required)
 | Method | Path | Notes |
