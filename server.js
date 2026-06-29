@@ -112,6 +112,25 @@ async function query(sql, params) {
   }
 }
 
+// ---- Blog table init ----
+query(`
+  CREATE TABLE IF NOT EXISTS blog_posts (
+    id           SERIAL PRIMARY KEY,
+    title        TEXT NOT NULL,
+    slug         TEXT NOT NULL UNIQUE,
+    content      TEXT NOT NULL DEFAULT '',
+    excerpt      TEXT NOT NULL DEFAULT '',
+    cover_image  TEXT,
+    tags         TEXT[] DEFAULT '{}',
+    author_type  TEXT NOT NULL DEFAULT 'admin',
+    author_id    INTEGER,
+    author_name  TEXT NOT NULL DEFAULT 'FitFlex',
+    status       TEXT NOT NULL DEFAULT 'published' CHECK (status IN ('draft','pending','published','rejected')),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published_at TIMESTAMPTZ
+  )
+`).catch(e => console.error('[blog] table init error:', e.message));
+
 // ---- JWT / Cookie helpers ----
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
@@ -2220,6 +2239,111 @@ app.post('/api/groups/:id/broadcast', requireAuth, async (req, res) => {
 // =====================
 // ADMIN ENDPOINTS
 // =====================
+
+// =====================
+// BLOG
+// =====================
+
+// Public — list published posts
+app.get('/api/blog', async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT id, title, slug, excerpt, cover_image, tags, author_name, author_type, published_at
+       FROM blog_posts WHERE status='published' ORDER BY published_at DESC NULLS LAST`
+    );
+    res.json({ posts: r.rows });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// Public — single post by slug
+app.get('/api/blog/:slug', async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT * FROM blog_posts WHERE slug=$1 AND status='published'`,
+      [req.params.slug]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Post not found' });
+    res.json({ post: r.rows[0] });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// Admin — list all posts (any status)
+app.get('/api/admin/blog', requireAdmin, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT id, title, slug, excerpt, cover_image, tags, author_name, author_type, status, created_at, published_at
+       FROM blog_posts ORDER BY created_at DESC`
+    );
+    res.json({ posts: r.rows });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// Admin — create post
+app.post('/api/admin/blog', requireAdmin, async (req, res) => {
+  const { title, slug, content, excerpt, cover_image, tags, author_name, status } = req.body || {};
+  if (!title || !slug) return res.status(400).json({ error: 'title and slug required' });
+  const safeSlug = slug.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
+  const pub = (status === 'published') ? new Date() : null;
+  try {
+    const r = await query(
+      `INSERT INTO blog_posts (title, slug, content, excerpt, cover_image, tags, author_name, author_type, status, published_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'admin',$8,$9) RETURNING *`,
+      [title, safeSlug, content || '', excerpt || '', cover_image || null,
+       tags || [], author_name || 'FitFlex', status || 'draft', pub]
+    );
+    res.status(201).json({ post: r.rows[0] });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'Slug already exists' });
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin — update post
+app.patch('/api/admin/blog/:id', requireAdmin, async (req, res) => {
+  const { title, slug, content, excerpt, cover_image, tags, author_name, status } = req.body || {};
+  try {
+    const existing = await query('SELECT * FROM blog_posts WHERE id=$1', [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: 'Post not found' });
+    const cur = existing.rows[0];
+    const newSlug = slug
+      ? slug.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-')
+      : cur.slug;
+    const wasPublished = cur.status === 'published';
+    const willPublish = (status || cur.status) === 'published';
+    const pub = willPublish ? (cur.published_at || new Date()) : null;
+    const r = await query(
+      `UPDATE blog_posts SET title=$1, slug=$2, content=$3, excerpt=$4, cover_image=$5,
+       tags=$6, author_name=$7, status=$8, published_at=$9 WHERE id=$10 RETURNING *`,
+      [title ?? cur.title, newSlug, content ?? cur.content, excerpt ?? cur.excerpt,
+       cover_image !== undefined ? cover_image : cur.cover_image,
+       tags ?? cur.tags, author_name ?? cur.author_name, status ?? cur.status, pub, req.params.id]
+    );
+    res.json({ post: r.rows[0] });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'Slug already exists' });
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Admin — delete post
+app.delete('/api/admin/blog/:id', requireAdmin, async (req, res) => {
+  try {
+    await query('DELETE FROM blog_posts WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
+
+// Admin — approve pending post (future: studio/user submissions)
+app.patch('/api/admin/blog/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    const r = await query(
+      `UPDATE blog_posts SET status='published', published_at=NOW() WHERE id=$1 RETURNING *`,
+      [req.params.id]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Post not found' });
+    res.json({ post: r.rows[0] });
+  } catch (e) { res.status(500).json({ error: 'Server error' }); }
+});
 
 function requireAdmin(req, res, next) {
   const secret = process.env.ADMIN_SECRET;
