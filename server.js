@@ -2271,8 +2271,7 @@ app.get('/api/blog/:slug', async (req, res) => {
 app.get('/api/admin/blog', requireAdmin, async (req, res) => {
   try {
     const r = await query(
-      `SELECT id, title, slug, excerpt, cover_image, tags, author_name, author_type, status, created_at, published_at
-       FROM blog_posts ORDER BY created_at DESC`
+      `SELECT * FROM blog_posts ORDER BY created_at DESC`
     );
     res.json({ posts: r.rows });
   } catch (e) { res.status(500).json({ error: 'Server error' }); }
