@@ -2244,6 +2244,41 @@ app.post('/api/groups/:id/broadcast', requireAuth, async (req, res) => {
 // BLOG
 // =====================
 
+// Sitemap
+app.get('/sitemap.xml', async (req, res) => {
+  const siteUrl = process.env.FRONTEND_URL || 'https://your-portfolio-g56q.vercel.app';
+  try {
+    const r = await query(
+      `SELECT slug, published_at FROM blog_posts WHERE status='published' ORDER BY published_at DESC`
+    );
+    const staticPages = ['', '/blog', '/studios', '/pricing', '/groups'];
+    const staticUrls = staticPages.map(path => `
+  <url>
+    <loc>${siteUrl}${path}</loc>
+    <changefreq>weekly</changefreq>
+    <priority>${path === '' ? '1.0' : '0.8'}</priority>
+  </url>`).join('');
+
+    const blogUrls = r.rows.map(post => `
+  <url>
+    <loc>${siteUrl}/blog/${post.slug}</loc>
+    <lastmod>${post.published_at ? new Date(post.published_at).toISOString().split('T')[0] : ''}</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+  </url>`).join('');
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${staticUrls}
+${blogUrls}
+</urlset>`;
+    res.setHeader('Content-Type', 'application/xml');
+    res.send(xml);
+  } catch (e) {
+    res.status(500).send('Error generating sitemap');
+  }
+});
+
 // Public — list published posts
 app.get('/api/blog', async (req, res) => {
   try {
