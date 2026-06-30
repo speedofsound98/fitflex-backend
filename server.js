@@ -2246,7 +2246,7 @@ app.post('/api/groups/:id/broadcast', requireAuth, async (req, res) => {
 
 // Sitemap
 app.get('/sitemap.xml', async (req, res) => {
-  const siteUrl = process.env.FRONTEND_URL || 'https://your-portfolio-g56q.vercel.app';
+  const siteUrl = (process.env.FRONTEND_URL || 'https://your-portfolio-g56q.vercel.app').replace(/\/$/, '');
   try {
     const r = await query(
       `SELECT slug, published_at FROM blog_posts WHERE status='published' ORDER BY published_at DESC`
