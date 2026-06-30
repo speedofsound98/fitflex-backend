@@ -2251,12 +2251,18 @@ app.get('/sitemap.xml', async (req, res) => {
     const r = await query(
       `SELECT slug, published_at FROM blog_posts WHERE status='published' ORDER BY published_at DESC`
     );
-    const staticPages = ['', '/blog', '/studios', '/pricing', '/groups'];
-    const staticUrls = staticPages.map(path => `
+    const staticPages = [
+      { path: '', priority: '1.0' },
+      { path: 'blog', priority: '0.8' },
+      { path: 'studios', priority: '0.8' },
+      { path: 'pricing', priority: '0.8' },
+      { path: 'groups', priority: '0.8' },
+    ];
+    const staticUrls = staticPages.map(({ path, priority }) => `
   <url>
-    <loc>${siteUrl}${path}</loc>
+    <loc>${siteUrl}${path ? '/' + path : ''}</loc>
     <changefreq>weekly</changefreq>
-    <priority>${path === '' ? '1.0' : '0.8'}</priority>
+    <priority>${priority}</priority>
   </url>`).join('');
 
     const blogUrls = r.rows.map(post => `
