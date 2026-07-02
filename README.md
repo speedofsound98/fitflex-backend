@@ -113,6 +113,9 @@ curl http://localhost:3000/api/ping
 | GET | `/api/studios/:id/slots` | Studio's appointment slots |
 | GET | `/api/credit-packs` | Available credit packs |
 | GET | `/api/users/:id/profile` | Public user profile |
+| GET | `/api/blog` | Published blog posts (list) |
+| GET | `/api/blog/:slug` | Single published blog post |
+| GET | `/sitemap.xml` | XML sitemap (also mirrored as a static file on the frontend) |
 | GET | `/api/groups` | All communities |
 | GET | `/api/groups/:id` | Community detail |
 | GET | `/api/groups/:id/events` | Events in a community |
@@ -178,6 +181,15 @@ curl http://localhost:3000/api/ping
 | POST | `/api/workout-plan/parse` | Parse Excel/CSV; returns sheets with per-cell colors |
 | POST | `/api/workout-plan/export` | Rebuild .xlsx from edited cell data; streams file with colors + bold preserved |
 
+### Admin — Blog (`x-admin-secret` header)
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/api/admin/blog` | All posts, any status (includes `content`) |
+| POST | `/api/admin/blog` | Create post (slug sanitized; sets `published_at` if status=published) |
+| PATCH | `/api/admin/blog/:id` | Update post |
+| DELETE | `/api/admin/blog/:id` | Delete post |
+| PATCH | `/api/admin/blog/:id/approve` | Approve a pending submission → published (future studio/user posts) |
+
 ### Notifications (JWT required)
 | Method | Path | Notes |
 |--------|------|-------|
@@ -213,6 +225,9 @@ curl http://localhost:3000/api/ping
 | `post_comments` | id, post_id, author_id, author_type, content, created_at |
 | `user_follows` | id, follower_id, following_id, created_at |
 | `direct_messages` | id, sender_type, sender_id, recipient_type, recipient_id, content, read, created_at |
+| `blog_posts` | id, title, slug(unique), content(HTML), excerpt, cover_image, tags[], author_type, author_id, author_name, status(draft/pending/published/rejected), created_at, published_at |
+
+> `blog_posts` self-creates at server startup via `CREATE TABLE IF NOT EXISTS` in `server.js` — not in `schema/fitflex_schema.sql`.
 
 ---
 
