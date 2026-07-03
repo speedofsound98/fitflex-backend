@@ -23,7 +23,11 @@ const app = express();
 
 // ---- Config ----
 const port = process.env.PORT || 3000;
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // Neon (and most hosted Postgres) require SSL; local dev does not
+  ssl: process.env.DATABASE_URL?.includes('neon.tech') ? { rejectUnauthorized: false } : false,
+});
 const JWT_SECRET = process.env.JWT_SECRET || 'fitflex-dev-secret-change-in-prod';
 const isProd = process.env.NODE_ENV === 'production';
 
