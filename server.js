@@ -116,6 +116,10 @@ async function query(sql, params) {
   }
 }
 
+// ---- Email notification prefs column ----
+query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_prefs JSONB NOT NULL DEFAULT '{"bookings":true,"reminders":true,"messages":true}'::jsonb`)
+  .catch(e => console.error('[migrate] email_prefs error:', e.message));
+
 // ---- Blog table init ----
 query(`
   CREATE TABLE IF NOT EXISTS blog_posts (
@@ -227,7 +231,7 @@ async function sendEmail({ to, subject, html, icsContent }) {
 }
 
 // Booking confirmation email (sent to user + studio)
-async function sendBookingConfirmation({ userEmail, userName, studioEmail, studioName, className, datetime, location, creditCost, bookingId }) {
+async function sendBookingConfirmation({ userEmail, userName, studioEmail, studioName, className, datetime, location, creditCost, bookingId, emailUser = true }) {
   const classDate = new Date(datetime);
   const classEnd = new Date(classDate.getTime() + 60 * 60 * 1000); // assume 1hr
   const friendlyDate = classDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
@@ -273,13 +277,15 @@ async function sendBookingConfirmation({ userEmail, userName, studioEmail, studi
     </div>`;
 
   await Promise.all([
-    sendEmail({ to: userEmail, subject: `Booking confirmed: ${className}`, html: userHtml, icsContent }),
+    emailUser
+      ? sendEmail({ to: userEmail, subject: `Booking confirmed: ${className}`, html: userHtml, icsContent })
+      : null,
     sendEmail({ to: studioEmail, subject: `New booking: ${className} — ${userName}`, html: studioHtml }),
   ]);
 }
 
 // Cancellation email (sent to user + studio)
-async function sendCancellationNotice({ userEmail, userName, studioEmail, studioName, className, datetime, creditCost }) {
+async function sendCancellationNotice({ userEmail, userName, studioEmail, studioName, className, datetime, creditCost, emailUser = true }) {
   const classDate = new Date(datetime);
   const friendlyDate = classDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
   const friendlyTime = classDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
@@ -310,7 +316,9 @@ async function sendCancellationNotice({ userEmail, userName, studioEmail, studio
     </div>`;
 
   await Promise.all([
-    sendEmail({ to: userEmail, subject: `Booking cancelled: ${className}`, html: userHtml }),
+    emailUser
+      ? sendEmail({ to: userEmail, subject: `Booking cancelled: ${className}`, html: userHtml })
+      : null,
     sendEmail({ to: studioEmail, subject: `Cancellation: ${className} — ${userName}`, html: studioHtml }),
   ]);
 }
@@ -542,7 +550,7 @@ app.get('/api/users/:userId/settings', requireAuth, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
   try {
-    const r = await query('SELECT id, name, email, bio, public_fields, credits, phone FROM users WHERE id=$1', [userId]);
+    const r = await query('SELECT id, name, email, bio, public_fields, credits, phone, email_prefs FROM users WHERE id=$1', [userId]);
     if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
     res.json({ user: r.rows[0] });
   } catch (e) {
@@ -554,16 +562,19 @@ app.get('/api/users/:userId/settings', requireAuth, async (req, res) => {
 app.patch('/api/users/:userId/settings', requireAuth, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
-  const allowed = ['name', 'bio', 'public_fields', 'phone'];
+  const allowed = ['name', 'bio', 'public_fields', 'phone', 'email_prefs'];
   const fields = [], values = [];
   let idx = 1;
   for (const [k, v] of Object.entries(req.body || {})) {
-    if (allowed.includes(k)) { fields.push(`${k}=$${idx++}`); values.push(v); }
+    if (allowed.includes(k)) {
+      fields.push(`${k}=$${idx++}`);
+      values.push(k === 'email_prefs' ? JSON.stringify(v) : v);
+    }
   }
   if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
   try {
     const r = await query(
-      `UPDATE users SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,email,bio,public_fields,credits,phone`,
+      `UPDATE users SET ${fields.join(',')} WHERE id=$${idx} RETURNING id,name,email,bio,public_fields,credits,phone,email_prefs`,
       [...values, userId]
     );
     if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
@@ -612,7 +623,7 @@ app.post('/api/book', requireAuth, async (req, res) => {
     const cls = clsRes.rows[0];
 
     // Get user info for email
-    const userRes = await query('SELECT id, name, email, credits FROM users WHERE id=$1', [user_id]);
+    const userRes = await query('SELECT id, name, email, credits, email_prefs FROM users WHERE id=$1', [user_id]);
     if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
     const user = userRes.rows[0];
 
@@ -660,6 +671,7 @@ app.post('/api/book', requireAuth, async (req, res) => {
       location: cls.location,
       creditCost: cls.credit_cost,
       bookingId,
+      emailUser: user.email_prefs?.bookings !== false,
     }).catch(err => console.error('[email] booking confirmation failed:', err));
 
     res.status(201).json({ message: 'Booked successfully' });
@@ -677,7 +689,7 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
   try {
     const r = await query(
       `SELECT b.id, b.user_id, c.datetime, c.credit_cost, c.name AS class_name,
-              u.name AS user_name, u.email AS user_email,
+              u.name AS user_name, u.email AS user_email, u.email_prefs AS user_email_prefs,
               s.id AS studio_id, s.name AS studio_name, s.email AS studio_email
          FROM bookings b
          JOIN classes c ON c.id = b.class_id
@@ -714,6 +726,7 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
       className: booking.class_name,
       datetime: booking.datetime,
       creditCost: booking.credit_cost,
+      emailUser: booking.user_email_prefs?.bookings !== false,
     }).catch(err => console.error('[email] cancellation notice failed:', err));
 
     res.json({ ok: true, message: 'Booking cancelled and credits refunded' });
@@ -934,7 +947,7 @@ app.post('/api/classes/:classId/message', requireAuth, async (req, res) => {
 
     // Get all booked users (with phone for WhatsApp)
     const usersRes = await query(
-      `SELECT u.id, u.name, u.email, u.phone
+      `SELECT u.id, u.name, u.email, u.phone, u.email_prefs
          FROM bookings b JOIN users u ON u.id = b.user_id
         WHERE b.class_id=$1`,
       [classId]
@@ -978,9 +991,11 @@ app.post('/api/classes/:classId/message', requireAuth, async (req, res) => {
         body: message.trim().length > 100 ? message.trim().slice(0, 100) + '…' : message.trim(),
       });
 
-      // Email
-      await sendEmail({ to: user.email, subject: `Message from ${cls.studio_name}: ${cls.name}`, html });
-      emailsSent++;
+      // Email (respect user's notification preference)
+      if (user.email_prefs?.messages !== false) {
+        await sendEmail({ to: user.email, subject: `Message from ${cls.studio_name}: ${cls.name}`, html });
+        emailsSent++;
+      }
 
       // WhatsApp (only if user has phone + Twilio configured)
       if (twilioClient && user.phone) {
@@ -2615,7 +2630,8 @@ async function sendEventReminders() {
          JOIN groups g ON g.id = ge.group_id
          JOIN group_members gm ON gm.group_id = ge.group_id
          JOIN users u ON u.id = gm.user_id
-        WHERE ge.datetime BETWEEN NOW() + INTERVAL '23 hours' AND NOW() + INTERVAL '25 hours'`,
+        WHERE ge.datetime BETWEEN NOW() + INTERVAL '23 hours' AND NOW() + INTERVAL '25 hours'
+          AND COALESCE((u.email_prefs->>'reminders')::boolean, true)`,
       []
     );
     if (!r.rows.length) return;
@@ -2653,7 +2669,8 @@ async function sendClassReminders() {
          JOIN studios s ON s.id = c.studio_id
          JOIN bookings b ON b.class_id = c.id
          JOIN users u ON u.id = b.user_id
-        WHERE c.datetime BETWEEN NOW() + INTERVAL '23 hours' AND NOW() + INTERVAL '25 hours'`,
+        WHERE c.datetime BETWEEN NOW() + INTERVAL '23 hours' AND NOW() + INTERVAL '25 hours'
+          AND COALESCE((u.email_prefs->>'reminders')::boolean, true)`,
       []
     );
     if (!r.rows.length) return;
