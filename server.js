@@ -18,6 +18,23 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const cloudinary = require('cloudinary').v2;
+const sanitizeHtml = require('sanitize-html');
+
+// Blog content is rendered with dangerouslySetInnerHTML on the frontend — sanitize on write.
+function cleanBlogHtml(html) {
+  if (!html) return '';
+  return sanitizeHtml(html, {
+    allowedTags: ['h1','h2','h3','h4','p','a','ul','ol','li','blockquote','strong','em','s','code','pre','br','hr','img','figure','figcaption'],
+    allowedAttributes: {
+      a: ['href','target','rel'],
+      img: ['src','alt','title'],
+    },
+    allowedSchemes: ['http','https','mailto'],
+    transformTags: {
+      a: sanitizeHtml.simpleTransform('a', { rel: 'noopener noreferrer', target: '_blank' }),
+    },
+  });
+}
 
 const app = express();
 
@@ -28,8 +45,12 @@ const pool = new Pool({
   // Neon (and most hosted Postgres) require SSL; local dev does not
   ssl: process.env.DATABASE_URL?.includes('neon.tech') ? { rejectUnauthorized: false } : false,
 });
-const JWT_SECRET = process.env.JWT_SECRET || 'fitflex-dev-secret-change-in-prod';
 const isProd = process.env.NODE_ENV === 'production';
+// In production a real secret is mandatory; never fall back to the dev value.
+if (isProd && !process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET env var is required in production');
+}
+const JWT_SECRET = process.env.JWT_SECRET || 'fitflex-dev-secret-change-in-prod';
 
 // Resend email client (only active when RESEND_API_KEY is set)
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
@@ -102,6 +123,24 @@ const resetLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 5,
   message: { error: 'Too many password reset requests. Please try again in 1 hour.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Cap account creation per IP (anti-spam)
+const signupLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10,
+  message: { error: 'Too many accounts created from this network. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// General write limiter for booking / payment / messaging spam
+const writeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 60,
+  message: { error: 'Too many requests. Please slow down and try again shortly.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -179,6 +218,21 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Session expired — please log in again' });
   }
 }
+
+// ---- Ownership helpers (authorization) ----
+// requireAuth only proves a caller is logged in; these prove they own the resource.
+function ownsUser(req, id) {
+  return req.user?.role === 'user' && req.user.id === Number(id);
+}
+function ownsStudio(req, id) {
+  return req.user?.role === 'studio' && req.user.id === Number(id);
+}
+const FORBIDDEN = { error: 'Forbidden' };
+
+// ---- Input validation helpers ----
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function isValidEmail(email) { return typeof email === 'string' && EMAIL_RE.test(email.trim()); }
+function isValidPassword(pw) { return typeof pw === 'string' && pw.length >= 8; }
 
 // ---- Email helpers ----
 
@@ -427,9 +481,11 @@ app.get('/api/users/:userId/profile', async (req, res) => {
 // =====================
 
 // POST /api/signup/user
-app.post('/api/signup/user', async (req, res) => {
+app.post('/api/signup/user', signupLimiter, async (req, res) => {
   const { name, email, password } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: 'name, email, and password are required' });
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'Please enter a valid email address' });
+  if (!isValidPassword(password)) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   try {
     const exists = await query('SELECT 1 FROM users WHERE name=$1 OR email=$2', [name, email]);
     if (exists.rows.length) return res.status(409).json({ error: 'Name or email already exists' });
@@ -449,9 +505,11 @@ app.post('/api/signup/user', async (req, res) => {
 });
 
 // POST /api/signup/studio
-app.post('/api/signup/studio', async (req, res) => {
+app.post('/api/signup/studio', signupLimiter, async (req, res) => {
   const { name, email, password, location } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: 'name, email, and password are required' });
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'Please enter a valid email address' });
+  if (!isValidPassword(password)) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   try {
     const exists = await query('SELECT 1 FROM studios WHERE name=$1 OR email=$2', [name, email]);
     if (exists.rows.length) return res.status(409).json({ error: 'Studio name or email already exists' });
@@ -527,6 +585,7 @@ app.post('/api/logout', (req, res) => {
 app.get('/api/users/:userId/bookings', requireAuth, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   try {
     const r = await query(
       `SELECT b.id, b.timestamp, b.payment_status,
@@ -549,6 +608,7 @@ app.get('/api/users/:userId/bookings', requireAuth, async (req, res) => {
 app.get('/api/users/:userId/settings', requireAuth, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   try {
     const r = await query('SELECT id, name, email, bio, public_fields, credits, phone, email_prefs FROM users WHERE id=$1', [userId]);
     if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
@@ -562,6 +622,7 @@ app.get('/api/users/:userId/settings', requireAuth, async (req, res) => {
 app.patch('/api/users/:userId/settings', requireAuth, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   const allowed = ['name', 'bio', 'public_fields', 'phone', 'email_prefs'];
   const fields = [], values = [];
   let idx = 1;
@@ -588,8 +649,10 @@ app.patch('/api/users/:userId/settings', requireAuth, async (req, res) => {
 app.patch('/api/users/:userId/password', requireAuth, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   const { currentPassword, newPassword } = req.body || {};
   if (!currentPassword || !newPassword) return res.status(400).json({ error: 'currentPassword and newPassword required' });
+  if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
   try {
     const r = await query('SELECT password FROM users WHERE id=$1', [userId]);
     if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
@@ -604,9 +667,10 @@ app.patch('/api/users/:userId/password', requireAuth, async (req, res) => {
 });
 
 // POST /api/book
-app.post('/api/book', requireAuth, async (req, res) => {
-  const { user_id, class_id } = req.body || {};
-  if (!user_id || !class_id) return res.status(400).json({ error: 'user_id and class_id are required' });
+app.post('/api/book', requireAuth, writeLimiter, async (req, res) => {
+  const { class_id } = req.body || {};
+  const user_id = req.user.id; // never trust a user_id from the body
+  if (!class_id) return res.status(400).json({ error: 'class_id is required' });
   try {
     // Check if already booked
     const already = await query('SELECT 1 FROM bookings WHERE user_id=$1 AND class_id=$2', [user_id, class_id]);
@@ -700,6 +764,7 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
     );
     if (!r.rows.length) return res.status(404).json({ error: 'Booking not found' });
     const booking = r.rows[0];
+    if (booking.user_id !== req.user.id) return res.status(403).json(FORBIDDEN);
     if (new Date(booking.datetime) <= new Date()) {
       return res.status(400).json({ error: 'Cannot cancel a class that has already started or passed' });
     }
@@ -745,6 +810,7 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
 app.patch('/api/studios/:studioId', requireAuth, async (req, res) => {
   const studioId = Number(req.params.studioId);
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  if (!ownsStudio(req, studioId)) return res.status(403).json(FORBIDDEN);
   const allowed = ['about', 'phone', 'website', 'instagram', 'city', 'neighbourhood', 'location', 'accepts_enquiries', 'offers_appointments', 'opening_hour', 'closing_hour', 'tagline', 'cover_color', 'cover_photo'];
   const fields = [], values = [];
   let idx = 1;
@@ -799,8 +865,10 @@ app.post('/api/studios/:studioId/cover-photo', requireAuth, upload.single('photo
 app.patch('/api/studios/:studioId/password', requireAuth, async (req, res) => {
   const studioId = Number(req.params.studioId);
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  if (!ownsStudio(req, studioId)) return res.status(403).json(FORBIDDEN);
   const { currentPassword, newPassword } = req.body || {};
   if (!currentPassword || !newPassword) return res.status(400).json({ error: 'currentPassword and newPassword required' });
+  if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
   try {
     const r = await query('SELECT password FROM studios WHERE id=$1', [studioId]);
     if (!r.rows.length) return res.status(404).json({ error: 'Studio not found' });
@@ -819,6 +887,7 @@ app.post('/api/studios/:studioId/classes', requireAuth, async (req, res) => {
   const studioId = Number(req.params.studioId);
   const { name, datetime, sport_type, credit_cost, capacity } = req.body || {};
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  if (!ownsStudio(req, studioId)) return res.status(403).json(FORBIDDEN);
   if (!name || !datetime) return res.status(400).json({ error: 'name and datetime are required' });
   const creditCost = (Number.isFinite(+credit_cost) && +credit_cost >= 0) ? +credit_cost : 1;
   const cap = Number.isFinite(+capacity) ? +capacity : null;
@@ -840,6 +909,9 @@ app.post('/api/studios/:studioId/classes', requireAuth, async (req, res) => {
 app.patch('/api/classes/:classId', requireAuth, async (req, res) => {
   const classId = Number(req.params.classId);
   if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
+  const owner = await query('SELECT studio_id FROM classes WHERE id=$1', [classId]);
+  if (!owner.rows.length) return res.status(404).json({ error: 'Class not found' });
+  if (!ownsStudio(req, owner.rows[0].studio_id)) return res.status(403).json(FORBIDDEN);
   const fields = [], values = [];
   let idx = 1;
   for (const [k, v] of Object.entries(req.body || {})) {
@@ -887,6 +959,9 @@ app.delete('/api/classes/:classId', requireAuth, async (req, res) => {
   const classId = Number(req.params.classId);
   if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
   try {
+    const owner = await query('SELECT studio_id FROM classes WHERE id=$1', [classId]);
+    if (!owner.rows.length) return res.status(404).json({ error: 'Class not found' });
+    if (!ownsStudio(req, owner.rows[0].studio_id)) return res.status(403).json(FORBIDDEN);
     const r = await query('DELETE FROM classes WHERE id=$1 RETURNING id', [classId]);
     if (!r.rows.length) return res.status(404).json({ error: 'Class not found' });
     res.json({ ok: true });
@@ -903,6 +978,7 @@ app.delete('/api/classes/:classId', requireAuth, async (req, res) => {
 app.get('/api/studios/:studioId/analytics', requireAuth, async (req, res) => {
   const studioId = Number(req.params.studioId);
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
+  if (!ownsStudio(req, studioId)) return res.status(403).json(FORBIDDEN);
   try {
     const r = await query(
       `SELECT c.id, c.name, c.datetime, c.credit_cost, c.capacity,
@@ -929,7 +1005,7 @@ app.get('/api/studios/:studioId/analytics', requireAuth, async (req, res) => {
 // =====================
 
 // POST /api/classes/:classId/message  — studio sends a message to all booked users
-app.post('/api/classes/:classId/message', requireAuth, async (req, res) => {
+app.post('/api/classes/:classId/message', requireAuth, writeLimiter, async (req, res) => {
   const classId = Number(req.params.classId);
   if (!Number.isInteger(classId)) return res.status(400).json({ error: 'Invalid class id' });
   const { message } = req.body || {};
@@ -944,6 +1020,7 @@ app.post('/api/classes/:classId/message', requireAuth, async (req, res) => {
     );
     if (!clsRes.rows.length) return res.status(404).json({ error: 'Class not found' });
     const cls = clsRes.rows[0];
+    if (!ownsStudio(req, cls.studio_id)) return res.status(403).json(FORBIDDEN);
 
     // Get all booked users (with phone for WhatsApp)
     const usersRes = await query(
@@ -1030,9 +1107,10 @@ app.get('/api/credit-packs', (req, res) => {
 });
 
 // POST /api/payments/create-session  — create Stripe Checkout session
-app.post('/api/payments/create-session', requireAuth, async (req, res) => {
+app.post('/api/payments/create-session', requireAuth, writeLimiter, async (req, res) => {
   if (!stripe) return res.status(503).json({ error: 'Payments not configured' });
-  const { pack_id, user_id } = req.body || {};
+  const { pack_id } = req.body || {};
+  const user_id = req.user.id; // never trust a user_id from the body
   const pack = CREDIT_PACKS.find(p => p.id === pack_id);
   if (!pack) return res.status(400).json({ error: 'Invalid credit pack' });
 
@@ -1117,6 +1195,7 @@ app.post('/api/payments/webhook',
 app.get('/api/users/:userId/purchases', requireAuth, async (req, res) => {
   const userId = Number(req.params.userId);
   if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user id' });
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   try {
     const r = await query(
       `SELECT id, credits, amount_cents, expires_at, created_at
@@ -1179,6 +1258,7 @@ app.get('/api/studios/:id/slots', async (req, res) => {
 // POST /api/studios/:id/slots  — create a slot (studio auth)
 app.post('/api/studios/:id/slots', requireAuth, async (req, res) => {
   const studioId = Number(req.params.id);
+  if (!ownsStudio(req, studioId)) return res.status(403).json(FORBIDDEN);
   const { datetime, duration_minutes, capacity, credit_cost, notes } = req.body || {};
   if (!datetime) return res.status(400).json({ error: 'datetime is required' });
   try {
@@ -1198,6 +1278,9 @@ app.post('/api/studios/:id/slots', requireAuth, async (req, res) => {
 app.delete('/api/slots/:id', requireAuth, async (req, res) => {
   const slotId = Number(req.params.id);
   try {
+    const owner = await query('SELECT studio_id FROM appointment_slots WHERE id=$1', [slotId]);
+    if (!owner.rows.length) return res.status(404).json({ error: 'Slot not found' });
+    if (!ownsStudio(req, owner.rows[0].studio_id)) return res.status(403).json(FORBIDDEN);
     await query('DELETE FROM appointment_slots WHERE id=$1', [slotId]);
     res.json({ ok: true });
   } catch (e) {
@@ -1726,7 +1809,10 @@ app.patch('/api/notifications/read-all', requireAuth, async (req, res) => {
 // PATCH /api/notifications/:id/read  — mark one as read
 app.patch('/api/notifications/:id/read', requireAuth, async (req, res) => {
   try {
-    await query('UPDATE notifications SET read=true WHERE id=$1', [req.params.id]);
+    await query(
+      'UPDATE notifications SET read=true WHERE id=$1 AND recipient_type=$2 AND recipient_id=$3',
+      [req.params.id, req.user.role, req.user.id]
+    );
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
@@ -1962,6 +2048,7 @@ app.delete('/api/groups/:id', requireAuth, async (req, res) => {
 // GET /api/users/:userId/groups  — groups a user belongs to
 app.get('/api/users/:userId/groups', requireAuth, async (req, res) => {
   const userId = Number(req.params.userId);
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   try {
     const r = await query(
       `SELECT g.id, g.name, g.sport_type, g.city, g.cover_emoji, g.is_private, gm.role,
@@ -2045,6 +2132,7 @@ app.get('/api/users/:id/followers', requireAuth, async (req, res) => {
 // GET /api/users/:id/feed  — activity feed from people you follow
 app.get('/api/users/:id/feed', requireAuth, async (req, res) => {
   const userId = Number(req.params.id);
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   try {
     // Bookings (only if user has made bookings public) + group joins from followed users
     const r = await query(
@@ -2347,7 +2435,7 @@ app.post('/api/admin/blog', requireAdmin, async (req, res) => {
     const r = await query(
       `INSERT INTO blog_posts (title, slug, content, excerpt, cover_image, tags, author_name, author_type, status, published_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,'admin',$8,$9) RETURNING *`,
-      [title, safeSlug, content || '', excerpt || '', cover_image || null,
+      [title, safeSlug, cleanBlogHtml(content), excerpt || '', cover_image || null,
        tags || [], author_name || 'FitFlex', status || 'draft', pub]
     );
     res.status(201).json({ post: r.rows[0] });
@@ -2373,7 +2461,7 @@ app.patch('/api/admin/blog/:id', requireAdmin, async (req, res) => {
     const r = await query(
       `UPDATE blog_posts SET title=$1, slug=$2, content=$3, excerpt=$4, cover_image=$5,
        tags=$6, author_name=$7, status=$8, published_at=$9 WHERE id=$10 RETURNING *`,
-      [title ?? cur.title, newSlug, content ?? cur.content, excerpt ?? cur.excerpt,
+      [title ?? cur.title, newSlug, content !== undefined ? cleanBlogHtml(content) : cur.content, excerpt ?? cur.excerpt,
        cover_image !== undefined ? cover_image : cur.cover_image,
        tags ?? cur.tags, author_name ?? cur.author_name, status ?? cur.status, pub, req.params.id]
     );
@@ -2541,7 +2629,7 @@ app.post('/auth/request-password-reset', resetLimiter, async (req, res) => {
         </div>`;
       await sendEmail({ to: email, subject: 'Reset your FitFlex studio password', html });
       const resp = { message: 'If the email exists, a reset link has been sent.' };
-      if (!resend) resp.devResetLink = resetLink;
+      if (!resend && !isProd) resp.devResetLink = resetLink;
       return res.json(resp);
     }
 
@@ -2578,7 +2666,7 @@ app.post('/auth/request-password-reset', resetLimiter, async (req, res) => {
 
       // In dev (no email configured), expose the link in the response
       const resp = { message: 'If the email exists, a reset link has been sent.' };
-      if (!resend) resp.devResetLink = resetLink;
+      if (!resend && !isProd) resp.devResetLink = resetLink;
       return res.json(resp);
     }
     return res.json({ message: 'If the email exists, a reset link has been sent.' });
@@ -2588,9 +2676,10 @@ app.post('/auth/request-password-reset', resetLimiter, async (req, res) => {
   }
 });
 
-app.post('/auth/reset-password', async (req, res) => {
+app.post('/auth/reset-password', resetLimiter, async (req, res) => {
   const { token, newPassword } = req.body || {};
   if (!token || !newPassword) return res.status(400).json({ error: 'Token and newPassword required' });
+  if (!isValidPassword(newPassword)) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   try {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     const found = await query(
