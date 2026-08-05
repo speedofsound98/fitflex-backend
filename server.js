@@ -178,6 +178,30 @@ query(`
   )
 `).catch(e => console.error('[blog] table init error:', e.message));
 
+// ---- Nutrition tracking init ----
+// Per-user daily food/macro log. `mode` records whether the entry was a rough
+// estimate (preset food × servings) or an exact manual entry.
+query(`
+  CREATE TABLE IF NOT EXISTS nutrition_entries (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    entry_date  DATE NOT NULL DEFAULT CURRENT_DATE,
+    name        TEXT NOT NULL,
+    protein     NUMERIC(7,1) NOT NULL DEFAULT 0,
+    carbs       NUMERIC(7,1) NOT NULL DEFAULT 0,
+    fat         NUMERIC(7,1) NOT NULL DEFAULT 0,
+    calories    NUMERIC(7,1) NOT NULL DEFAULT 0,
+    mode        TEXT NOT NULL DEFAULT 'exact' CHECK (mode IN ('exact','estimate')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )
+`)
+  // Index must wait for the table — these run un-awaited at startup, so chain it.
+  .then(() => query(`CREATE INDEX IF NOT EXISTS idx_nutrition_user_date ON nutrition_entries(user_id, entry_date)`))
+  .catch(e => console.error('[nutrition] table init error:', e.message));
+// Per-user daily targets (survives across devices alongside the log).
+query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nutrition_goal JSONB NOT NULL DEFAULT '{"protein":150,"carbs":200,"fat":65,"calories":2000}'::jsonb`)
+  .catch(e => console.error('[migrate] nutrition_goal error:', e.message));
+
 // ---- JWT / Cookie helpers ----
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
@@ -1814,6 +1838,117 @@ app.patch('/api/notifications/:id/read', requireAuth, async (req, res) => {
       [req.params.id, req.user.role, req.user.id]
     );
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// =====================
+// NUTRITION TRACKING  (users only)
+// =====================
+
+// Guard: nutrition is a member-only feature (studios don't have food logs).
+function requireUserRole(req, res) {
+  if (req.user?.role !== 'user') { res.status(403).json(FORBIDDEN); return false; }
+  return true;
+}
+
+// Coerce to a non-negative number, capped to keep the NUMERIC(7,1) column safe.
+function macroNum(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.min(n, 99999);
+}
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+// GET /api/nutrition?date=YYYY-MM-DD — a day's entries, totals, and the user's goal
+app.get('/api/nutrition', requireAuth, async (req, res) => {
+  if (!requireUserRole(req, res)) return;
+  const date = DATE_RE.test(req.query.date || '') ? req.query.date : null;
+  try {
+    const params = [req.user.id];
+    let where = 'user_id=$1';
+    if (date) { params.push(date); where += ` AND entry_date=$2`; }
+    const r = await query(
+      `SELECT id, entry_date, name, protein, carbs, fat, calories, mode, created_at
+         FROM nutrition_entries
+        WHERE ${where}
+        ORDER BY created_at ASC`,
+      params
+    );
+    const entries = r.rows.map(e => ({
+      ...e,
+      protein: Number(e.protein), carbs: Number(e.carbs),
+      fat: Number(e.fat), calories: Number(e.calories),
+    }));
+    const totals = entries.reduce((t, e) => ({
+      protein: t.protein + e.protein, carbs: t.carbs + e.carbs,
+      fat: t.fat + e.fat, calories: t.calories + e.calories,
+    }), { protein: 0, carbs: 0, fat: 0, calories: 0 });
+
+    const g = await query(`SELECT nutrition_goal FROM users WHERE id=$1`, [req.user.id]);
+    res.json({ entries, totals, goal: g.rows[0]?.nutrition_goal || {} });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/nutrition — add an entry {date?, name, protein, carbs, fat, calories, mode}
+app.post('/api/nutrition', requireAuth, async (req, res) => {
+  if (!requireUserRole(req, res)) return;
+  const { name, protein, carbs, fat, calories, mode } = req.body || {};
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'A food name is required' });
+  }
+  const date = DATE_RE.test(req.body?.date || '') ? req.body.date : null;
+  const entryMode = mode === 'estimate' ? 'estimate' : 'exact';
+  try {
+    const r = await query(
+      `INSERT INTO nutrition_entries (user_id, entry_date, name, protein, carbs, fat, calories, mode)
+       VALUES ($1, COALESCE($2::date, CURRENT_DATE), $3, $4, $5, $6, $7, $8)
+       RETURNING id, entry_date, name, protein, carbs, fat, calories, mode, created_at`,
+      [req.user.id, date, name.trim().slice(0, 120),
+       macroNum(protein), macroNum(carbs), macroNum(fat), macroNum(calories), entryMode]
+    );
+    const e = r.rows[0];
+    res.status(201).json({ entry: {
+      ...e, protein: Number(e.protein), carbs: Number(e.carbs),
+      fat: Number(e.fat), calories: Number(e.calories),
+    }});
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/nutrition/:id — remove one of the caller's own entries
+app.delete('/api/nutrition/:id', requireAuth, async (req, res) => {
+  if (!requireUserRole(req, res)) return;
+  try {
+    const r = await query(
+      `DELETE FROM nutrition_entries WHERE id=$1 AND user_id=$2`,
+      [req.params.id, req.user.id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Entry not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/nutrition/goal — update daily targets {protein, carbs, fat, calories}
+app.patch('/api/nutrition/goal', requireAuth, async (req, res) => {
+  if (!requireUserRole(req, res)) return;
+  const goal = {
+    protein: macroNum(req.body?.protein),
+    carbs: macroNum(req.body?.carbs),
+    fat: macroNum(req.body?.fat),
+    calories: macroNum(req.body?.calories),
+  };
+  try {
+    await query(`UPDATE users SET nutrition_goal=$1 WHERE id=$2`,
+      [JSON.stringify(goal), req.user.id]);
+    res.json({ goal });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }

@@ -161,6 +161,10 @@ curl http://localhost:3000/api/ping
 | GET | `/api/messages/inbox` | DM inbox (threads with unread counts) |
 | GET | `/api/messages/:type/:partnerId` | Conversation with a user or studio |
 | POST | `/api/messages/:type/:recipientId` | Send a direct message |
+| GET | `/api/nutrition?date=YYYY-MM-DD` | Day's food entries + macro totals + user goal (users only) |
+| POST | `/api/nutrition` | Add a food entry `{date?, name, protein, carbs, fat, calories, mode}` (`mode`: `exact`\|`estimate`) |
+| DELETE | `/api/nutrition/:id` | Delete one of the caller's entries |
+| PATCH | `/api/nutrition/goal` | Update daily macro/calorie targets `{protein, carbs, fat, calories}` |
 
 ### Studio (JWT required)
 | Method | Path | Notes |
@@ -208,7 +212,8 @@ curl http://localhost:3000/api/ping
 
 | Table | Key columns |
 |-------|-------------|
-| `users` | id, name, email, password, credits(5), bio, public_fields, phone |
+| `users` | id, name, email, password, credits(5), bio, public_fields, phone, email_prefs, nutrition_goal (JSONB daily targets) |
+| `nutrition_entries` | id, user_id, entry_date, name, protein, carbs, fat, calories, mode(exact/estimate), created_at |
 | `studios` | id, name, email, password, location, city, neighbourhood, about, phone, website, instagram, verified, accepts_enquiries, offers_appointments, opening_hour(9), closing_hour(18), tagline, cover_color('blue'), cover_photo |
 | `classes` | id, studio_id, name, datetime, sport_type, credit_cost, capacity |
 | `bookings` | id, user_id, class_id, payment_status, timestamp |
@@ -227,7 +232,7 @@ curl http://localhost:3000/api/ping
 | `direct_messages` | id, sender_type, sender_id, recipient_type, recipient_id, content, read, created_at |
 | `blog_posts` | id, title, slug(unique), content(HTML), excerpt, cover_image, tags[], author_type, author_id, author_name, status(draft/pending/published/rejected), created_at, published_at |
 
-> `blog_posts` self-creates at server startup via `CREATE TABLE IF NOT EXISTS` in `server.js` — not in `schema/fitflex_schema.sql`.
+> `blog_posts` and `nutrition_entries` self-create at server startup via `CREATE TABLE IF NOT EXISTS` in `server.js` (the `users.nutrition_goal` column is added by an `ALTER TABLE … IF NOT EXISTS` migration there too) — not in `schema/fitflex_schema.sql`.
 
 ---
 
