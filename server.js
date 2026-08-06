@@ -199,8 +199,17 @@ query(`
   .then(() => query(`CREATE INDEX IF NOT EXISTS idx_nutrition_user_date ON nutrition_entries(user_id, entry_date)`))
   .catch(e => console.error('[nutrition] table init error:', e.message));
 // Per-user daily targets (survives across devices alongside the log).
-query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nutrition_goal JSONB NOT NULL DEFAULT '{"protein":150,"carbs":200,"fat":65,"calories":2000}'::jsonb`)
+query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nutrition_goal JSONB NOT NULL DEFAULT '{"protein":150,"carbs":200,"fat":65,"calories":2000,"water":2000}'::jsonb`)
   .catch(e => console.error('[migrate] nutrition_goal error:', e.message));
+// One water total (ml) per user per day.
+query(`
+  CREATE TABLE IF NOT EXISTS nutrition_water (
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    entry_date  DATE NOT NULL DEFAULT CURRENT_DATE,
+    ml          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, entry_date)
+  )
+`).catch(e => console.error('[nutrition] water table init error:', e.message));
 
 // ---- JWT / Cookie helpers ----
 function signToken(payload) {
@@ -1888,7 +1897,34 @@ app.get('/api/nutrition', requireAuth, async (req, res) => {
     }), { protein: 0, carbs: 0, fat: 0, calories: 0 });
 
     const g = await query(`SELECT nutrition_goal FROM users WHERE id=$1`, [req.user.id]);
-    res.json({ entries, totals, goal: g.rows[0]?.nutrition_goal || {} });
+    const goal = g.rows[0]?.nutrition_goal || {};
+    if (goal.water == null) goal.water = 2000;
+    const w = await query(
+      `SELECT ml FROM nutrition_water WHERE user_id=$1 AND entry_date=COALESCE($2::date, CURRENT_DATE)`,
+      [req.user.id, date]
+    );
+    res.json({ entries, totals, water: w.rows[0]?.ml || 0, goal });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/nutrition/water — adjust the day's water total by ±ml {date?, delta}
+app.post('/api/nutrition/water', requireAuth, async (req, res) => {
+  if (!requireUserRole(req, res)) return;
+  const date = DATE_RE.test(req.body?.date || '') ? req.body.date : null;
+  const delta = Math.round(Number(req.body?.delta));
+  if (!Number.isFinite(delta)) return res.status(400).json({ error: 'Invalid amount' });
+  try {
+    const r = await query(
+      `INSERT INTO nutrition_water (user_id, entry_date, ml)
+       VALUES ($1, COALESCE($2::date, CURRENT_DATE), GREATEST(0, LEAST(20000, $3)))
+       ON CONFLICT (user_id, entry_date)
+       DO UPDATE SET ml = GREATEST(0, LEAST(20000, nutrition_water.ml + $3))
+       RETURNING ml`,
+      [req.user.id, date, delta]
+    );
+    res.json({ water: r.rows[0].ml });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -1939,13 +1975,18 @@ app.delete('/api/nutrition/:id', requireAuth, async (req, res) => {
 // PATCH /api/nutrition/goal — update daily targets {protein, carbs, fat, calories}
 app.patch('/api/nutrition/goal', requireAuth, async (req, res) => {
   if (!requireUserRole(req, res)) return;
-  const goal = {
-    protein: macroNum(req.body?.protein),
-    carbs: macroNum(req.body?.carbs),
-    fat: macroNum(req.body?.fat),
-    calories: macroNum(req.body?.calories),
-  };
   try {
+    // Merge onto the existing goal so a partial update never wipes other fields.
+    const cur = await query(`SELECT nutrition_goal FROM users WHERE id=$1`, [req.user.id]);
+    const base = cur.rows[0]?.nutrition_goal || {};
+    const pick = (k, dflt) => (req.body?.[k] != null ? macroNum(req.body[k]) : (base[k] ?? dflt));
+    const goal = {
+      protein: pick('protein', 150),
+      carbs: pick('carbs', 200),
+      fat: pick('fat', 65),
+      calories: pick('calories', 2000),
+      water: pick('water', 2000),
+    };
     await query(`UPDATE users SET nutrition_goal=$1 WHERE id=$2`,
       [JSON.stringify(goal), req.user.id]);
     res.json({ goal });
