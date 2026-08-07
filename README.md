@@ -166,6 +166,7 @@ curl http://localhost:3000/api/ping
 | DELETE | `/api/nutrition/:id` | Delete one of the caller's entries |
 | POST | `/api/nutrition/water` | Adjust the day's water total by `{delta}` ml (±, clamped 0–20000); returns new total |
 | PATCH | `/api/nutrition/goal` | Update daily targets `{protein, carbs, fat, calories, water}` (merge-safe — partial updates keep other fields) |
+| PATCH | `/api/nutrition/profile` | Save the private body/training profile + computed goals `{profile, goal}`; preserves the water target |
 
 ### Studio (JWT required)
 | Method | Path | Notes |
@@ -213,7 +214,7 @@ curl http://localhost:3000/api/ping
 
 | Table | Key columns |
 |-------|-------------|
-| `users` | id, name, email, password, credits(5), bio, public_fields, phone, email_prefs, nutrition_goal (JSONB daily targets) |
+| `users` | id, name, email, password, credits(5), bio, public_fields, phone, email_prefs, nutrition_goal (JSONB daily targets), nutrition_profile (JSONB, private — sex/age/weight/height/weekly load) |
 | `nutrition_entries` | id, user_id, entry_date, name, protein, carbs, fat, calories, mode(exact/estimate), created_at |
 | `nutrition_water` | user_id, entry_date, ml — one row per user per day (PK on both); `nutrition_goal.water` holds the ml target |
 | `studios` | id, name, email, password, location, city, neighbourhood, about, phone, website, instagram, verified, accepts_enquiries, offers_appointments, opening_hour(9), closing_hour(18), tagline, cover_color('blue'), cover_photo |

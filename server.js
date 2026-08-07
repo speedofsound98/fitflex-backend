@@ -210,6 +210,9 @@ query(`
     PRIMARY KEY (user_id, entry_date)
   )
 `).catch(e => console.error('[nutrition] water table init error:', e.message));
+// Optional, private body + training profile used to auto-compute macro targets.
+query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS nutrition_profile JSONB`)
+  .catch(e => console.error('[migrate] nutrition_profile error:', e.message));
 
 // ---- JWT / Cookie helpers ----
 function signToken(payload) {
@@ -1896,14 +1899,14 @@ app.get('/api/nutrition', requireAuth, async (req, res) => {
       fat: t.fat + e.fat, calories: t.calories + e.calories,
     }), { protein: 0, carbs: 0, fat: 0, calories: 0 });
 
-    const g = await query(`SELECT nutrition_goal FROM users WHERE id=$1`, [req.user.id]);
+    const g = await query(`SELECT nutrition_goal, nutrition_profile FROM users WHERE id=$1`, [req.user.id]);
     const goal = g.rows[0]?.nutrition_goal || {};
     if (goal.water == null) goal.water = 2000;
     const w = await query(
       `SELECT ml FROM nutrition_water WHERE user_id=$1 AND entry_date=COALESCE($2::date, CURRENT_DATE)`,
       [req.user.id, date]
     );
-    res.json({ entries, totals, water: w.rows[0]?.ml || 0, goal });
+    res.json({ entries, totals, water: w.rows[0]?.ml || 0, goal, profile: g.rows[0]?.nutrition_profile || null });
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -1990,6 +1993,48 @@ app.patch('/api/nutrition/goal', requireAuth, async (req, res) => {
     await query(`UPDATE users SET nutrition_goal=$1 WHERE id=$2`,
       [JSON.stringify(goal), req.user.id]);
     res.json({ goal });
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PATCH /api/nutrition/profile — save the private body/training profile and the
+// goals computed from it (client does the math; we persist both atomically).
+app.patch('/api/nutrition/profile', requireAuth, async (req, res) => {
+  if (!requireUserRole(req, res)) return;
+  const p = req.body?.profile || {};
+  const sex = ['male', 'female', 'other'].includes(p.sex) ? p.sex : 'other';
+  const goalDir = ['maintain', 'lose', 'gain'].includes(p.goalDir) ? p.goalDir : 'maintain';
+  const profile = {
+    sex, goalDir,
+    age: macroNum(p.age),
+    weight: macroNum(p.weight),
+    height: macroNum(p.height),
+    runsPerWeek: macroNum(p.runsPerWeek),
+    runMin: macroNum(p.runMin),
+    strengthPerWeek: macroNum(p.strengthPerWeek),
+    strengthMin: macroNum(p.strengthMin),
+  };
+  try {
+    let out = { profile };
+    if (req.body?.goal) {
+      const cur = await query(`SELECT nutrition_goal FROM users WHERE id=$1`, [req.user.id]);
+      const base = cur.rows[0]?.nutrition_goal || {};
+      const goal = {
+        protein: macroNum(req.body.goal.protein),
+        carbs: macroNum(req.body.goal.carbs),
+        fat: macroNum(req.body.goal.fat),
+        calories: macroNum(req.body.goal.calories),
+        water: base.water ?? 2000, // preserve the separately-managed water target
+      };
+      await query(`UPDATE users SET nutrition_profile=$1, nutrition_goal=$2 WHERE id=$3`,
+        [JSON.stringify(profile), JSON.stringify(goal), req.user.id]);
+      out.goal = goal;
+    } else {
+      await query(`UPDATE users SET nutrition_profile=$1 WHERE id=$2`,
+        [JSON.stringify(profile), req.user.id]);
+    }
+    res.json(out);
   } catch (e) {
     res.status(500).json({ error: 'Server error' });
   }
