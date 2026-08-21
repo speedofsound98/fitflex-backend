@@ -46,7 +46,6 @@ npm install
 PORT=3000
 DATABASE_URL=postgresql://<your-mac-username>@localhost:5432/fitflex
 FRONTEND_URL=http://localhost:5173
-ADMIN_SECRET=fitflex-admin-2026!
 JWT_SECRET=your-random-secret
 NODE_ENV=development
 
