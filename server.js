@@ -2973,7 +2973,7 @@ async function sendEventReminders() {
 async function sendClassReminders() {
   try {
     const r = await query(
-      `SELECT c.id, c.name, c.datetime, s.name AS studio_name, s.location,
+      `SELECT c.id, c.name AS class_name, c.datetime, s.name AS studio_name, s.location,
               u.name AS user_name, u.email AS user_email
          FROM classes c
          JOIN studios s ON s.id = c.studio_id
@@ -3122,6 +3122,11 @@ app.post('/api/workout-plan/export', requireAuth, async (req, res) => {
 // ---- Start ----
 app.listen(port, '0.0.0.0', () => {
   console.log(`FitFlex backend running on http://0.0.0.0:${port}`);
-  if (!resend) console.log('[email] No RESEND_API_KEY — emails will be logged to console only');
+  console.log(resend
+    ? `[email] Resend active — sending as ${FROM_EMAIL}`
+    : '[email] No RESEND_API_KEY — emails will be logged to console only');
+  console.log(twilioClient
+    ? `[whatsapp] Twilio active — sending from ${TWILIO_WHATSAPP_FROM}`
+    : '[whatsapp] No TWILIO_ACCOUNT_SID/AUTH_TOKEN — WhatsApp messages disabled');
   if (!isProd) console.log('[auth] Running in development mode — cookies use SameSite=Lax');
 });
