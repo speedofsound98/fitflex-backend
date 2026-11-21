@@ -1,0 +1,10 @@
+#!/bin/sh
+# Enable once per clone:  git config core.hooksPath .githooks
+# Blocks commits that contain secrets or fail lint.
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --staged --redact --no-banner || {
+    echo "gitleaks: possible secret in staged changes. Commit blocked."; exit 1; }
+else
+  echo "pre-commit: gitleaks not installed (brew install gitleaks); skipping secret scan."
+fi
+npx --no-install eslint . || { echo "ESLint failed. Commit blocked."; exit 1; }
