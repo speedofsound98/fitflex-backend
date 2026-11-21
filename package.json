@@ -4,7 +4,7 @@
   "description": "the projects structure is as follows:",
   "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
     "start": "node server.js"
   },
   "repository": {
@@ -38,5 +38,8 @@
     "twilio": "^6.0.2",
     "uuid": "^13.0.0",
     "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "supertest": "^7.3.2"
   }
 }
