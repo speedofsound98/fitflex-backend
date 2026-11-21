@@ -19,6 +19,19 @@ const path = require('path');
 const fs = require('fs');
 const cloudinary = require('cloudinary').v2;
 const sanitizeHtml = require('sanitize-html');
+const helmet = require('helmet');
+
+// Escape user-controlled text before putting it into email HTML. Without this,
+// a studio/user name or message could inject links/markup into emails that
+// arrive from FitFlex's own domain (phishing).
+function esc(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // Blog content is rendered with dangerouslySetInnerHTML on the frontend — sanitize on write.
 function cleanBlogHtml(html) {
@@ -37,6 +50,14 @@ function cleanBlogHtml(html) {
 }
 
 const app = express();
+
+// Render (and most PaaS hosts) sit behind one reverse proxy. Without this,
+// req.ip is the proxy's address, so every visitor shares one rate-limit bucket.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
+
+// Security headers. Uploaded images are loaded cross-origin by the frontend,
+// so allow cross-origin resource loading.
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
 // ---- Config ----
 const port = process.env.PORT || 3000;
@@ -73,7 +94,10 @@ const CREDIT_PACKS = [
 ];
 
 // ---- Middleware ----
-app.use(express.json());
+// The Stripe webhook must receive the raw, unparsed body to verify its
+// signature, so skip JSON parsing for that one route.
+const jsonParser = express.json();
+app.use((req, res, next) => (req.path === '/api/payments/webhook' ? next() : jsonParser(req, res, next)));
 app.use(cookieParser());
 
 // ---- File uploads ----
@@ -154,6 +178,48 @@ async function query(sql, params) {
     client.release();
   }
 }
+
+// Run `fn(client)` inside a real transaction on ONE pooled connection.
+// (Calling query('BEGIN') etc. does not work: each query() call may use a
+// different connection, so the statements are never actually grouped.)
+async function withTransaction(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Throw inside a route/transaction to return a specific status + message.
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// ---- Schema migrations needed by the credit-safety fixes ----
+// Record what was actually paid, so a later price change can't inflate refunds.
+const schemaReady = Promise.all([
+  query('ALTER TABLE bookings ADD COLUMN IF NOT EXISTS credits_paid INT')
+    .catch(e => console.error('[migrate] bookings.credits_paid error:', e.message)),
+  query('ALTER TABLE slot_bookings ADD COLUMN IF NOT EXISTS credits_paid INT')
+    .catch(e => console.error('[migrate] slot_bookings.credits_paid error:', e.message)),
+  // Studio password resets: password_resets.user_id has an FK to users, so the
+  // old "negative id = studio" trick always failed. Give studios their own column.
+  query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS studio_id INT REFERENCES studios(id) ON DELETE CASCADE')
+    .catch(e => console.error('[migrate] password_resets.studio_id error:', e.message)),
+  // Stripe retries webhooks — one purchase row (and one credit grant) per session.
+  query('CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_purchases_session ON credit_purchases(stripe_session_id)')
+    .catch(e => console.error('[migrate] credit_purchases unique index error:', e.message)),
+]);
 
 // ---- Email notification prefs column ----
 query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_prefs JSONB NOT NULL DEFAULT '{"bookings":true,"reminders":true,"messages":true}'::jsonb`)
@@ -265,6 +331,32 @@ function ownsStudio(req, id) {
 }
 const FORBIDDEN = { error: 'Forbidden' };
 
+// requireUser — like requireAuth, but only member (role 'user') accounts pass.
+// User and studio ids come from separate tables and overlap, so any route that
+// treats req.user.id as a users.id MUST use this, or studio #5 acts as user #5.
+function requireUser(req, res, next) {
+  requireAuth(req, res, () => {
+    if (req.user.role !== 'user') {
+      return res.status(403).json({ error: 'This action is only available to member accounts' });
+    }
+    next();
+  });
+}
+
+// Credit cost must be a whole, non-negative, bounded number of credits.
+// Negative costs would turn booking into a credit generator.
+const MAX_CREDIT_COST = 100;
+function parseCreditCost(v, fallback = 1) {
+  if (v === undefined || v === null || v === '') return fallback;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 && n <= MAX_CREDIT_COST ? n : null;
+}
+function parseCapacity(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 && n <= 10000 ? n : undefined;
+}
+
 // ---- Input validation helpers ----
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 function isValidEmail(email) { return typeof email === 'string' && EMAIL_RE.test(email.trim()); }
@@ -340,10 +432,10 @@ async function sendBookingConfirmation({ userEmail, userName, studioEmail, studi
   const userHtml = `
     <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
       <h2 style="color:#2563eb">Booking Confirmed! 🎉</h2>
-      <p>Hi ${userName}, you're all set for:</p>
+      <p>Hi ${esc(userName)}, you're all set for:</p>
       <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-        <p style="margin:0 0 6px"><strong>${className}</strong></p>
-        <p style="margin:0 0 4px;color:#555">📍 ${studioName}${location ? ' · ' + location : ''}</p>
+        <p style="margin:0 0 6px"><strong>${esc(className)}</strong></p>
+        <p style="margin:0 0 4px;color:#555">📍 ${esc(studioName)}${location ? ' · ' + esc(location) : ''}</p>
         <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
         <p style="margin:0;color:#555">🕐 ${friendlyTime}</p>
       </div>
@@ -356,9 +448,9 @@ async function sendBookingConfirmation({ userEmail, userName, studioEmail, studi
   const studioHtml = `
     <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
       <h2 style="color:#2563eb">New Booking 📋</h2>
-      <p><strong>${userName}</strong> has booked a spot in:</p>
+      <p><strong>${esc(userName)}</strong> has booked a spot in:</p>
       <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-        <p style="margin:0 0 6px"><strong>${className}</strong></p>
+        <p style="margin:0 0 6px"><strong>${esc(className)}</strong></p>
         <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
         <p style="margin:0;color:#555">🕐 ${friendlyTime}</p>
       </div>
@@ -368,9 +460,9 @@ async function sendBookingConfirmation({ userEmail, userName, studioEmail, studi
 
   await Promise.all([
     emailUser
-      ? sendEmail({ to: userEmail, subject: `Booking confirmed: ${className}`, html: userHtml, icsContent })
+      ? sendEmail({ to: userEmail, subject: `Booking confirmed: ${esc(className)}`, html: userHtml, icsContent })
       : null,
-    sendEmail({ to: studioEmail, subject: `New booking: ${className} — ${userName}`, html: studioHtml }),
+    sendEmail({ to: studioEmail, subject: `New booking: ${esc(className)} — ${esc(userName)}`, html: studioHtml }),
   ]);
 }
 
@@ -383,9 +475,9 @@ async function sendCancellationNotice({ userEmail, userName, studioEmail, studio
   const userHtml = `
     <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
       <h2 style="color:#dc2626">Booking Cancelled</h2>
-      <p>Hi ${userName}, your booking has been cancelled:</p>
+      <p>Hi ${esc(userName)}, your booking has been cancelled:</p>
       <div style="background:#fef2f2;border-radius:12px;padding:16px;margin:16px 0">
-        <p style="margin:0 0 6px"><strong>${className}</strong> @ ${studioName}</p>
+        <p style="margin:0 0 6px"><strong>${esc(className)}</strong> @ ${esc(studioName)}</p>
         <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate} · ${friendlyTime}</p>
       </div>
       <p style="color:#555"><strong>${creditCost} credit${creditCost !== 1 ? 's' : ''}</strong> have been refunded to your account.</p>
@@ -396,9 +488,9 @@ async function sendCancellationNotice({ userEmail, userName, studioEmail, studio
   const studioHtml = `
     <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
       <h2 style="color:#dc2626">Booking Cancelled</h2>
-      <p><strong>${userName}</strong> has cancelled their booking for:</p>
+      <p><strong>${esc(userName)}</strong> has cancelled their booking for:</p>
       <div style="background:#fef2f2;border-radius:12px;padding:16px;margin:16px 0">
-        <p style="margin:0 0 6px"><strong>${className}</strong></p>
+        <p style="margin:0 0 6px"><strong>${esc(className)}</strong></p>
         <p style="margin:0;color:#555">📅 ${friendlyDate} · ${friendlyTime}</p>
       </div>
       <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
@@ -565,6 +657,7 @@ app.post('/api/signup/studio', signupLimiter, async (req, res) => {
 });
 
 // POST /api/login
+const DUMMY_HASH = bcrypt.hashSync('timing-equaliser-not-a-real-password', 10);
 app.post('/api/login', loginLimiter, async (req, res) => {
   try {
     let { email, password } = req.body || {};
@@ -572,7 +665,8 @@ app.post('/api/login', loginLimiter, async (req, res) => {
       return res.status(400).json({ error: 'email and password are required' });
     }
     email = email.trim().toLowerCase();
-    password = password.trim();
+    // Don't trim the password: signup/reset store it untrimmed, so trimming
+    // here locked out anyone whose password starts/ends with a space.
 
     // Try users
     let r = await query('SELECT id, name, email, password FROM users WHERE lower(email)=$1', [email]);
@@ -596,7 +690,10 @@ app.post('/api/login', loginLimiter, async (req, res) => {
       return res.json({ user: { id: s.id, name: s.name, email: s.email, role: 'studio' }, token });
     }
 
-    return res.status(404).json({ error: 'No account found for this email' });
+    // Same response + similar timing as a wrong password, so the login form
+    // can't be used to discover which emails have accounts.
+    await bcrypt.compare(password, DUMMY_HASH);
+    return res.status(401).json({ error: 'Invalid credentials' });
   } catch (err) {
     console.error('[login] error', err);
     return res.status(500).json({ error: 'Server error' });
@@ -703,53 +800,52 @@ app.patch('/api/users/:userId/password', requireAuth, async (req, res) => {
 });
 
 // POST /api/book
-app.post('/api/book', requireAuth, writeLimiter, async (req, res) => {
-  const { class_id } = req.body || {};
-  const user_id = req.user.id; // never trust a user_id from the body
-  if (!class_id) return res.status(400).json({ error: 'class_id is required' });
+app.post('/api/book', requireUser, writeLimiter, async (req, res) => {
+  const classId = Number(req.body?.class_id);
+  const userId = req.user.id; // never trust a user_id from the body
+  if (!Number.isInteger(classId)) return res.status(400).json({ error: 'class_id is required' });
   try {
-    // Check if already booked
-    const already = await query('SELECT 1 FROM bookings WHERE user_id=$1 AND class_id=$2', [user_id, class_id]);
-    if (already.rows.length) return res.status(409).json({ error: 'You have already booked this class' });
+    const { cls, user, bookingId } = await withTransaction(async (client) => {
+      // Lock the class row: concurrent bookings for the same class queue up here,
+      // so the capacity count below can't be raced.
+      const clsRes = await client.query(
+        `SELECT c.id, c.name, c.datetime, c.credit_cost, c.capacity,
+                s.id AS studio_id, s.name AS studio_name, s.email AS studio_email, s.location
+           FROM classes c JOIN studios s ON s.id = c.studio_id WHERE c.id=$1
+            FOR UPDATE OF c`,
+        [classId]
+      );
+      if (!clsRes.rows.length) throw new HttpError(404, 'Class not found');
+      const cls = clsRes.rows[0];
+      const cost = Math.max(0, cls.credit_cost ?? 0);
 
-    // Get class + studio info for email
-    const clsRes = await query(
-      `SELECT c.id, c.name, c.datetime, c.credit_cost, c.capacity,
-              s.id AS studio_id, s.name AS studio_name, s.email AS studio_email, s.location
-         FROM classes c JOIN studios s ON s.id = c.studio_id WHERE c.id=$1`,
-      [class_id]
-    );
-    if (!clsRes.rows.length) return res.status(404).json({ error: 'Class not found' });
-    const cls = clsRes.rows[0];
+      // Lock the user row: concurrent bookings by the same user can't double-spend.
+      const userRes = await client.query(
+        'SELECT id, name, email, credits, email_prefs FROM users WHERE id=$1 FOR UPDATE',
+        [userId]
+      );
+      if (!userRes.rows.length) throw new HttpError(404, 'User not found');
+      const user = userRes.rows[0];
 
-    // Get user info for email
-    const userRes = await query('SELECT id, name, email, credits, email_prefs FROM users WHERE id=$1', [user_id]);
-    if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
-    const user = userRes.rows[0];
+      const already = await client.query('SELECT 1 FROM bookings WHERE user_id=$1 AND class_id=$2', [userId, classId]);
+      if (already.rows.length) throw new HttpError(409, 'You have already booked this class');
 
-    // Check credits
-    if (user.credits < cls.credit_cost) {
-      return res.status(400).json({ error: `Not enough credits. You have ${user.credits}, class costs ${cls.credit_cost}.` });
-    }
-
-    // Capacity check
-    if (cls.capacity) {
-      const booked = await query('SELECT COUNT(*) AS c FROM bookings WHERE class_id=$1', [class_id]);
-      if (Number(booked.rows[0].c) >= cls.capacity) {
-        return res.status(400).json({ error: 'This class is fully booked' });
+      if (cls.capacity) {
+        const booked = await client.query('SELECT COUNT(*)::int AS c FROM bookings WHERE class_id=$1', [classId]);
+        if (booked.rows[0].c >= cls.capacity) throw new HttpError(400, 'This class is fully booked');
       }
-    }
 
-    // Insert booking + deduct credits in transaction
-    await query('BEGIN', []);
-    const bookingRes = await query(
-      'INSERT INTO bookings (user_id, class_id, payment_status) VALUES ($1,$2,$3) RETURNING id',
-      [user_id, class_id, 'paid']
-    );
-    await query('UPDATE users SET credits=credits-$1 WHERE id=$2', [cls.credit_cost, user_id]);
-    await query('COMMIT', []);
+      if (user.credits < cost) {
+        throw new HttpError(400, `Not enough credits. You have ${user.credits}, class costs ${cost}.`);
+      }
 
-    const bookingId = bookingRes.rows[0].id;
+      const bookingRes = await client.query(
+        'INSERT INTO bookings (user_id, class_id, payment_status, credits_paid) VALUES ($1,$2,$3,$4) RETURNING id',
+        [userId, classId, 'paid', cost]
+      );
+      await client.query('UPDATE users SET credits=credits-$1 WHERE id=$2', [cost, userId]);
+      return { cls, user, bookingId: bookingRes.rows[0].id };
+    });
 
     // Notify studio of new booking (non-blocking)
     createNotification({
@@ -776,19 +872,19 @@ app.post('/api/book', requireAuth, writeLimiter, async (req, res) => {
 
     res.status(201).json({ message: 'Booked successfully' });
   } catch (err) {
-    await query('ROLLBACK', []).catch(() => {});
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
     console.error('book error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
 // DELETE /api/bookings/:id  — cancel + refund
-app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
+app.delete('/api/bookings/:id', requireUser, async (req, res) => {
   const bookingId = Number(req.params.id);
   if (!Number.isInteger(bookingId)) return res.status(400).json({ error: 'Invalid booking id' });
   try {
     const r = await query(
-      `SELECT b.id, b.user_id, c.datetime, c.credit_cost, c.name AS class_name,
+      `SELECT b.id, b.user_id, c.datetime, COALESCE(b.credits_paid, c.credit_cost) AS credit_cost, c.name AS class_name,
               u.name AS user_name, u.email AS user_email, u.email_prefs AS user_email_prefs,
               s.id AS studio_id, s.name AS studio_name, s.email AS studio_email
          FROM bookings b
@@ -804,10 +900,17 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
     if (new Date(booking.datetime) <= new Date()) {
       return res.status(400).json({ error: 'Cannot cancel a class that has already started or passed' });
     }
-    await query('BEGIN', []);
-    await query('DELETE FROM bookings WHERE id=$1', [bookingId]);
-    await query('UPDATE users SET credits=credits+$1 WHERE id=$2', [booking.credit_cost, booking.user_id]);
-    await query('COMMIT', []);
+    await withTransaction(async (client) => {
+      // The DELETE is the source of truth: if a concurrent request already
+      // cancelled this booking, no row comes back and no refund is issued.
+      const del = await client.query(
+        'DELETE FROM bookings WHERE id=$1 AND user_id=$2 RETURNING id',
+        [bookingId, req.user.id]
+      );
+      if (!del.rows.length) throw new HttpError(404, 'Booking not found');
+      const refund = Math.max(0, booking.credit_cost ?? 0);
+      await client.query('UPDATE users SET credits=credits+$1 WHERE id=$2', [refund, req.user.id]);
+    });
 
     // Notify studio of cancellation (non-blocking)
     createNotification({
@@ -832,7 +935,7 @@ app.delete('/api/bookings/:id', requireAuth, async (req, res) => {
 
     res.json({ ok: true, message: 'Booking cancelled and credits refunded' });
   } catch (e) {
-    await query('ROLLBACK', []).catch(() => {});
+    if (e instanceof HttpError) return res.status(e.status).json({ error: e.message });
     console.error('cancel booking error:', e);
     res.status(500).json({ error: 'Server error' });
   }
@@ -925,8 +1028,10 @@ app.post('/api/studios/:studioId/classes', requireAuth, async (req, res) => {
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
   if (!ownsStudio(req, studioId)) return res.status(403).json(FORBIDDEN);
   if (!name || !datetime) return res.status(400).json({ error: 'name and datetime are required' });
-  const creditCost = (Number.isFinite(+credit_cost) && +credit_cost >= 0) ? +credit_cost : 1;
-  const cap = Number.isFinite(+capacity) ? +capacity : null;
+  const creditCost = parseCreditCost(credit_cost);
+  if (creditCost === null) return res.status(400).json({ error: `credit_cost must be a whole number between 0 and ${MAX_CREDIT_COST}` });
+  const cap = parseCapacity(capacity);
+  if (cap === undefined) return res.status(400).json({ error: 'capacity must be a positive whole number' });
   try {
     const r = await query(
       `INSERT INTO classes (studio_id, name, datetime, sport_type, credit_cost, capacity)
@@ -952,8 +1057,18 @@ app.patch('/api/classes/:classId', requireAuth, async (req, res) => {
   let idx = 1;
   for (const [k, v] of Object.entries(req.body || {})) {
     if (['name','datetime','sport_type','credit_cost','capacity'].includes(k)) {
+      let val = v;
+      if (k === 'datetime') val = new Date(v);
+      if (k === 'credit_cost') {
+        val = parseCreditCost(v, null);
+        if (val === null) return res.status(400).json({ error: `credit_cost must be a whole number between 0 and ${MAX_CREDIT_COST}` });
+      }
+      if (k === 'capacity') {
+        val = parseCapacity(v);
+        if (val === undefined) return res.status(400).json({ error: 'capacity must be a positive whole number' });
+      }
       fields.push(`${k}=$${idx++}`);
-      values.push(k === 'datetime' ? new Date(v) : v);
+      values.push(val);
     }
   }
   if (!fields.length) return res.status(400).json({ error: 'No valid fields to update' });
@@ -1077,14 +1192,14 @@ app.post('/api/classes/:classId/message', requireAuth, writeLimiter, async (req,
 
     const html = `
       <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
-        <h2 style="color:#2563eb">Message from ${cls.studio_name} 📣</h2>
+        <h2 style="color:#2563eb">Message from ${esc(cls.studio_name)} 📣</h2>
         <p>You have a message regarding your upcoming class:</p>
         <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-          <p style="margin:0 0 6px"><strong>${cls.name}</strong></p>
+          <p style="margin:0 0 6px"><strong>${esc(cls.name)}</strong></p>
           <p style="margin:0;color:#555">📅 ${friendlyDate} · ${friendlyTime}</p>
         </div>
         <div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin:16px 0">
-          <p style="white-space:pre-wrap;margin:0;color:#1a1a1a">${message.trim()}</p>
+          <p style="white-space:pre-wrap;margin:0;color:#1a1a1a">${esc(message.trim())}</p>
         </div>
         <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
         <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
@@ -1143,7 +1258,7 @@ app.get('/api/credit-packs', (req, res) => {
 });
 
 // POST /api/payments/create-session  — create Stripe Checkout session
-app.post('/api/payments/create-session', requireAuth, writeLimiter, async (req, res) => {
+app.post('/api/payments/create-session', requireUser, writeLimiter, async (req, res) => {
   if (!stripe) return res.status(503).json({ error: 'Payments not configured' });
   const { pack_id } = req.body || {};
   const user_id = req.user.id; // never trust a user_id from the body
@@ -1201,25 +1316,37 @@ app.post('/api/payments/webhook',
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object;
       if (session.payment_status === 'paid') {
-        const userId = Number(session.metadata.user_id);
-        const credits = Number(session.metadata.credits);
-        const packId = session.metadata.pack_id;
-        const pack = CREDIT_PACKS.find(p => p.id === packId);
+        const userId = Number(session.metadata?.user_id);
+        const pack = CREDIT_PACKS.find(p => p.id === session.metadata?.pack_id);
+        if (!Number.isInteger(userId) || !pack) {
+          console.error('[stripe] Session missing valid metadata:', session.id);
+          return res.json({ received: true });
+        }
+        const credits = pack.credits; // trust our own pack table, not metadata
         const expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000); // 1 year
 
         try {
-          await query('BEGIN', []);
-          await query('UPDATE users SET credits=credits+$1 WHERE id=$2', [credits, userId]);
-          await query(
-            `INSERT INTO credit_purchases (user_id, credits, amount_cents, stripe_session_id, expires_at)
-             VALUES ($1,$2,$3,$4,$5)`,
-            [userId, credits, pack ? pack.price_cents : 0, session.id, expiresAt]
-          );
-          await query('COMMIT', []);
-          console.log(`[stripe] +${credits} credits for user ${userId}`);
+          const granted = await withTransaction(async (client) => {
+            // Stripe retries webhooks. The unique index on stripe_session_id makes
+            // the insert a no-op for a session we've already processed.
+            const ins = await client.query(
+              `INSERT INTO credit_purchases (user_id, credits, amount_cents, stripe_session_id, expires_at)
+               VALUES ($1,$2,$3,$4,$5)
+               ON CONFLICT (stripe_session_id) DO NOTHING
+               RETURNING id`,
+              [userId, credits, pack.price_cents, session.id, expiresAt]
+            );
+            if (!ins.rows.length) return false;
+            await client.query('UPDATE users SET credits=credits+$1 WHERE id=$2', [credits, userId]);
+            return true;
+          });
+          console.log(granted
+            ? `[stripe] +${credits} credits for user ${userId}`
+            : `[stripe] Duplicate webhook for session ${session.id} — ignored`);
         } catch (e) {
-          await query('ROLLBACK', []).catch(() => {});
           console.error('[stripe] Credit update failed:', e);
+          // Non-2xx makes Stripe retry later instead of silently losing the purchase.
+          return res.status(500).json({ error: 'Credit update failed' });
         }
       }
     }
@@ -1252,7 +1379,11 @@ app.get('/api/users/:userId/purchases', requireAuth, async (req, res) => {
 app.get('/api/studios/:id/slots', async (req, res) => {
   const studioId = Number(req.params.id);
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
-  const { from, to, userId } = req.query;
+  const { from, to } = req.query;
+  // Which slots *I* booked — derived from the session, never from a query param
+  // (?userId= let anyone see any user's appointment bookings).
+  const viewer = optionalAuth(req);
+  const userId = viewer?.role === 'user' ? viewer.id : null;
   try {
     let sql = `
       SELECT s.id, s.datetime, s.duration_minutes, s.capacity, s.credit_cost, s.notes,
@@ -1297,12 +1428,16 @@ app.post('/api/studios/:id/slots', requireAuth, async (req, res) => {
   if (!ownsStudio(req, studioId)) return res.status(403).json(FORBIDDEN);
   const { datetime, duration_minutes, capacity, credit_cost, notes } = req.body || {};
   if (!datetime) return res.status(400).json({ error: 'datetime is required' });
+  const creditCost = parseCreditCost(credit_cost);
+  if (creditCost === null) return res.status(400).json({ error: `credit_cost must be a whole number between 0 and ${MAX_CREDIT_COST}` });
+  const cap = parseCapacity(capacity);
+  if (cap === undefined) return res.status(400).json({ error: 'capacity must be a positive whole number' });
   try {
     const r = await query(
       `INSERT INTO appointment_slots (studio_id, datetime, duration_minutes, capacity, credit_cost, notes)
        VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING *`,
-      [studioId, new Date(datetime), duration_minutes || 60, capacity || 1, credit_cost ?? 1, notes || null]
+      [studioId, new Date(datetime), duration_minutes || 60, cap ?? 1, creditCost, notes || null]
     );
     res.status(201).json({ slot: r.rows[0] });
   } catch (e) {
@@ -1325,33 +1460,38 @@ app.delete('/api/slots/:id', requireAuth, async (req, res) => {
 });
 
 // POST /api/slots/:id/book  — user books a slot
-app.post('/api/slots/:id/book', requireAuth, async (req, res) => {
+app.post('/api/slots/:id/book', requireUser, writeLimiter, async (req, res) => {
   const slotId = Number(req.params.id);
   const userId = req.user.id;
+  if (!Number.isInteger(slotId)) return res.status(400).json({ error: 'Invalid slot id' });
   try {
-    // Check capacity
-    const slot = await query(
-      `SELECT s.*, COUNT(sb.id)::int AS booked_count
-         FROM appointment_slots s
-         LEFT JOIN slot_bookings sb ON sb.slot_id = s.id
-        WHERE s.id=$1 GROUP BY s.id`,
-      [slotId]
-    );
-    if (!slot.rows.length) return res.status(404).json({ error: 'Slot not found' });
-    const s = slot.rows[0];
-    if (s.booked_count >= s.capacity) return res.status(400).json({ error: 'This slot is fully booked' });
+    const s = await withTransaction(async (client) => {
+      // Lock the slot so concurrent bookings can't exceed capacity.
+      const slot = await client.query('SELECT * FROM appointment_slots WHERE id=$1 FOR UPDATE', [slotId]);
+      if (!slot.rows.length) throw new HttpError(404, 'Slot not found');
+      const s = slot.rows[0];
+      const cost = Math.max(0, s.credit_cost ?? 0);
 
-    // Check user credits
-    const userRes = await query('SELECT credits FROM users WHERE id=$1', [userId]);
-    if (userRes.rows[0].credits < s.credit_cost) {
-      return res.status(400).json({ error: `Not enough credits. You have ${userRes.rows[0].credits}, slot costs ${s.credit_cost}.` });
-    }
+      const userRes = await client.query('SELECT credits FROM users WHERE id=$1 FOR UPDATE', [userId]);
+      if (!userRes.rows.length) throw new HttpError(404, 'User not found');
 
-    // Book + deduct credits in transaction
-    await query('BEGIN', []);
-    await query('INSERT INTO slot_bookings (slot_id, user_id) VALUES ($1,$2)', [slotId, userId]);
-    await query('UPDATE users SET credits=credits-$1 WHERE id=$2', [s.credit_cost, userId]);
-    await query('COMMIT', []);
+      const already = await client.query('SELECT 1 FROM slot_bookings WHERE slot_id=$1 AND user_id=$2', [slotId, userId]);
+      if (already.rows.length) throw new HttpError(409, 'You have already booked this slot');
+
+      const booked = await client.query('SELECT COUNT(*)::int AS c FROM slot_bookings WHERE slot_id=$1', [slotId]);
+      if (booked.rows[0].c >= s.capacity) throw new HttpError(400, 'This slot is fully booked');
+
+      if (userRes.rows[0].credits < cost) {
+        throw new HttpError(400, `Not enough credits. You have ${userRes.rows[0].credits}, slot costs ${cost}.`);
+      }
+
+      await client.query(
+        'INSERT INTO slot_bookings (slot_id, user_id, credits_paid) VALUES ($1,$2,$3)',
+        [slotId, userId, cost]
+      );
+      await client.query('UPDATE users SET credits=credits-$1 WHERE id=$2', [cost, userId]);
+      return s;
+    });
 
     // Notify studio
     const studioRes = await query('SELECT id, name FROM studios WHERE id=$1', [s.studio_id]);
@@ -1367,26 +1507,36 @@ app.post('/api/slots/:id/book', requireAuth, async (req, res) => {
 
     res.status(201).json({ ok: true });
   } catch (e) {
-    await query('ROLLBACK', []).catch(() => {});
+    if (e instanceof HttpError) return res.status(e.status).json({ error: e.message });
     console.error('book slot error:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
 // DELETE /api/slots/:id/book  — user cancels a slot booking
-app.delete('/api/slots/:id/book', requireAuth, async (req, res) => {
+app.delete('/api/slots/:id/book', requireUser, writeLimiter, async (req, res) => {
   const slotId = Number(req.params.id);
   const userId = req.user.id;
+  if (!Number.isInteger(slotId)) return res.status(400).json({ error: 'Invalid slot id' });
   try {
-    const slot = await query('SELECT credit_cost FROM appointment_slots WHERE id=$1', [slotId]);
-    if (!slot.rows.length) return res.status(404).json({ error: 'Slot not found' });
-    await query('BEGIN', []);
-    await query('DELETE FROM slot_bookings WHERE slot_id=$1 AND user_id=$2', [slotId, userId]);
-    await query('UPDATE users SET credits=credits+$1 WHERE id=$2', [slot.rows[0].credit_cost, userId]);
-    await query('COMMIT', []);
+    await withTransaction(async (client) => {
+      // Refund ONLY if a booking row was actually deleted. Previously the refund
+      // ran unconditionally, so repeating this call minted unlimited credits.
+      const del = await client.query(
+        `DELETE FROM slot_bookings sb
+          USING appointment_slots s
+          WHERE sb.slot_id=$1 AND sb.user_id=$2 AND s.id=sb.slot_id
+         RETURNING COALESCE(sb.credits_paid, s.credit_cost) AS refund`,
+        [slotId, userId]
+      );
+      if (!del.rows.length) throw new HttpError(404, 'You have no booking for this slot');
+      const refund = Math.max(0, del.rows[0].refund ?? 0);
+      await client.query('UPDATE users SET credits=credits+$1 WHERE id=$2', [refund, userId]);
+    });
     res.json({ ok: true });
   } catch (e) {
-    await query('ROLLBACK', []).catch(() => {});
+    if (e instanceof HttpError) return res.status(e.status).json({ error: e.message });
+    console.error('cancel slot error:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1448,7 +1598,7 @@ app.get('/api/events/:id', async (req, res) => {
 });
 
 // POST /api/groups/:id/events  — create event (group admin only)
-app.post('/api/groups/:id/events', requireAuth, async (req, res) => {
+app.post('/api/groups/:id/events', requireUser, async (req, res) => {
   const groupId = Number(req.params.id);
   const userId = req.user.id;
   const { title, description, datetime, location } = req.body || {};
@@ -1496,7 +1646,7 @@ app.post('/api/groups/:id/events', requireAuth, async (req, res) => {
 });
 
 // PATCH /api/events/:id  — update event (admin only)
-app.patch('/api/events/:id', requireAuth, async (req, res) => {
+app.patch('/api/events/:id', requireUser, async (req, res) => {
   const eventId = Number(req.params.id);
   const userId = req.user.id;
   try {
@@ -1531,7 +1681,7 @@ app.patch('/api/events/:id', requireAuth, async (req, res) => {
 });
 
 // DELETE /api/events/:id  — delete event (admin only)
-app.delete('/api/events/:id', requireAuth, async (req, res) => {
+app.delete('/api/events/:id', requireUser, async (req, res) => {
   const eventId = Number(req.params.id);
   const userId = req.user.id;
   try {
@@ -1552,7 +1702,7 @@ app.delete('/api/events/:id', requireAuth, async (req, res) => {
 });
 
 // POST /api/events/:id/rsvp  — RSVP to an event
-app.post('/api/events/:id/rsvp', requireAuth, async (req, res) => {
+app.post('/api/events/:id/rsvp', requireUser, async (req, res) => {
   const eventId = Number(req.params.id);
   const userId = req.user.id;
   const { status } = req.body || {};
@@ -1573,7 +1723,7 @@ app.post('/api/events/:id/rsvp', requireAuth, async (req, res) => {
 });
 
 // DELETE /api/events/:id/rsvp  — remove RSVP
-app.delete('/api/events/:id/rsvp', requireAuth, async (req, res) => {
+app.delete('/api/events/:id/rsvp', requireUser, async (req, res) => {
   const eventId = Number(req.params.id);
   const userId = req.user.id;
   try {
@@ -1600,7 +1750,8 @@ app.get('/api/groups/:id/posts', async (req, res) => {
     if (!groupRes.rows[0].is_feed_public) {
       // Feed is private — must be a member
       const user = optionalAuth(req);
-      if (!user) return res.status(403).json({ error: 'This group\'s feed is private', feedPrivate: true });
+      // Studios can't be group members; their id would collide with a users.id.
+      if (!user || user.role !== 'user') return res.status(403).json({ error: 'This group\'s feed is private', feedPrivate: true });
       const membership = await query(
         'SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2',
         [groupId, user.id]
@@ -1629,7 +1780,7 @@ app.get('/api/groups/:id/posts', async (req, res) => {
 });
 
 // POST /api/groups/:id/posts  — create a post (members only)
-app.post('/api/groups/:id/posts', requireAuth, async (req, res) => {
+app.post('/api/groups/:id/posts', requireUser, async (req, res) => {
   const groupId = Number(req.params.id);
   const userId = req.user.id;
   const { content } = req.body || {};
@@ -1678,7 +1829,7 @@ app.post('/api/groups/:id/posts', requireAuth, async (req, res) => {
 });
 
 // DELETE /api/posts/:id  — delete post (author or group admin)
-app.delete('/api/posts/:id', requireAuth, async (req, res) => {
+app.delete('/api/posts/:id', requireUser, async (req, res) => {
   const postId = Number(req.params.id);
   const userId = req.user.id;
   try {
@@ -1706,6 +1857,19 @@ app.get('/api/posts/:id/comments', async (req, res) => {
   const postId = Number(req.params.id);
   if (!Number.isInteger(postId)) return res.status(400).json({ error: 'Invalid post id' });
   try {
+    // Same visibility rule as the group feed: private feeds are members-only.
+    const g = await query(
+      `SELECT g.id, g.is_feed_public FROM group_posts p JOIN groups g ON g.id = p.group_id WHERE p.id=$1`,
+      [postId]
+    );
+    if (!g.rows.length) return res.status(404).json({ error: 'Post not found' });
+    if (!g.rows[0].is_feed_public) {
+      const viewer = optionalAuth(req);
+      const member = viewer?.role === 'user' && (await query(
+        'SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2', [g.rows[0].id, viewer.id]
+      )).rows.length;
+      if (!member) return res.status(403).json({ error: 'Join the group to see comments', feedPrivate: true });
+    }
     const r = await query(
       `SELECT c.id, c.content, c.created_at, u.id AS user_id, u.name AS user_name
          FROM post_comments c JOIN users u ON u.id = c.user_id
@@ -1720,7 +1884,7 @@ app.get('/api/posts/:id/comments', async (req, res) => {
 });
 
 // POST /api/posts/:id/comments  — add a comment
-app.post('/api/posts/:id/comments', requireAuth, async (req, res) => {
+app.post('/api/posts/:id/comments', requireUser, async (req, res) => {
   const postId = Number(req.params.id);
   const userId = req.user.id;
   const { content } = req.body || {};
@@ -1766,7 +1930,7 @@ app.post('/api/posts/:id/comments', requireAuth, async (req, res) => {
 });
 
 // DELETE /api/comments/:id  — delete comment (author or admin)
-app.delete('/api/comments/:id', requireAuth, async (req, res) => {
+app.delete('/api/comments/:id', requireUser, async (req, res) => {
   const commentId = Number(req.params.id);
   const userId = req.user.id;
   try {
@@ -2048,7 +2212,7 @@ app.patch('/api/nutrition/profile', requireAuth, async (req, res) => {
 // (already handled by the existing GET /api/studios/:studioId route — just needs the column in SELECT)
 
 // POST /api/studios/:studioId/enquire  — user sends custom time enquiry to studio
-app.post('/api/studios/:studioId/enquire', requireAuth, async (req, res) => {
+app.post('/api/studios/:studioId/enquire', requireUser, async (req, res) => {
   const studioId = Number(req.params.studioId);
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
   const { message } = req.body || {};
@@ -2082,15 +2246,15 @@ app.post('/api/studios/:studioId/enquire', requireAuth, async (req, res) => {
     // Also send email to studio (non-blocking)
     sendEmail({
       to: (await query('SELECT email FROM studios WHERE id=$1', [studioId])).rows[0]?.email,
-      subject: `New enquiry from ${user.name}`,
+      subject: `New enquiry from ${esc(user.name)}`,
       html: `
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
           <h2 style="color:#2563eb">New Enquiry 💬</h2>
-          <p><strong>${user.name}</strong> (${user.email}) sent you an enquiry:</p>
+          <p><strong>${esc(user.name)}</strong> (${esc(user.email)}) sent you an enquiry:</p>
           <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-            <p style="white-space:pre-wrap;margin:0">${message.trim()}</p>
+            <p style="white-space:pre-wrap;margin:0">${esc(message.trim())}</p>
           </div>
-          <p style="color:#888;font-size:13px">Reply directly to ${user.email}</p>
+          <p style="color:#888;font-size:13px">Reply directly to ${esc(user.email)}</p>
           <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
           <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
         </div>`,
@@ -2165,7 +2329,7 @@ app.get('/api/groups/:id', async (req, res) => {
 });
 
 // POST /api/groups  — create a group (auth required, creator becomes admin)
-app.post('/api/groups', requireAuth, async (req, res) => {
+app.post('/api/groups', requireUser, async (req, res) => {
   const { name, sport_type, city, description, cover_emoji, is_private } = req.body || {};
   if (!name || !name.trim()) return res.status(400).json({ error: 'Group name is required' });
   const userId = req.user.id;
@@ -2189,7 +2353,7 @@ app.post('/api/groups', requireAuth, async (req, res) => {
 });
 
 // PATCH /api/groups/:id  — update group (admin only)
-app.patch('/api/groups/:id', requireAuth, async (req, res) => {
+app.patch('/api/groups/:id', requireUser, async (req, res) => {
   const groupId = Number(req.params.id);
   const userId = req.user.id;
   try {
@@ -2218,7 +2382,7 @@ app.patch('/api/groups/:id', requireAuth, async (req, res) => {
 });
 
 // POST /api/groups/:id/join  — join a group
-app.post('/api/groups/:id/join', requireAuth, async (req, res) => {
+app.post('/api/groups/:id/join', requireUser, async (req, res) => {
   const groupId = Number(req.params.id);
   const userId = req.user.id;
   try {
@@ -2236,7 +2400,7 @@ app.post('/api/groups/:id/join', requireAuth, async (req, res) => {
 });
 
 // DELETE /api/groups/:id/leave  — leave a group
-app.delete('/api/groups/:id/leave', requireAuth, async (req, res) => {
+app.delete('/api/groups/:id/leave', requireUser, async (req, res) => {
   const groupId = Number(req.params.id);
   const userId = req.user.id;
   try {
@@ -2248,7 +2412,7 @@ app.delete('/api/groups/:id/leave', requireAuth, async (req, res) => {
 });
 
 // DELETE /api/groups/:id  — delete group (admin only)
-app.delete('/api/groups/:id', requireAuth, async (req, res) => {
+app.delete('/api/groups/:id', requireUser, async (req, res) => {
   const groupId = Number(req.params.id);
   const userId = req.user.id;
   try {
@@ -2293,7 +2457,7 @@ app.get('/api/users/:userId/groups', requireAuth, async (req, res) => {
 // =====================
 
 // POST /api/users/:id/follow
-app.post('/api/users/:id/follow', requireAuth, async (req, res) => {
+app.post('/api/users/:id/follow', requireUser, async (req, res) => {
   const followingId = Number(req.params.id);
   const followerId = req.user.id;
   if (followerId === followingId) return res.status(400).json({ error: 'Cannot follow yourself' });
@@ -2302,10 +2466,11 @@ app.post('/api/users/:id/follow', requireAuth, async (req, res) => {
       'INSERT INTO user_follows (follower_id, following_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
       [followerId, followingId]
     );
-    const target = await query('SELECT name FROM users WHERE id=$1', [followingId]);
+    if (!Number.isInteger(followingId)) return res.status(400).json({ error: 'Invalid user id' });
+    const follower = await query('SELECT name FROM users WHERE id=$1', [followerId]);
     await createNotification({
       recipientType: 'user', recipientId: followingId,
-      type: 'follow', title: `${req.user.email} is now following you`,
+      type: 'follow', title: `${follower.rows[0]?.name || 'Someone'} is now following you`,
       body: 'Someone new is following your activity.',
     });
     res.json({ ok: true });
@@ -2313,7 +2478,7 @@ app.post('/api/users/:id/follow', requireAuth, async (req, res) => {
 });
 
 // DELETE /api/users/:id/follow
-app.delete('/api/users/:id/follow', requireAuth, async (req, res) => {
+app.delete('/api/users/:id/follow', requireUser, async (req, res) => {
   const followingId = Number(req.params.id);
   const followerId = req.user.id;
   try {
@@ -2325,6 +2490,7 @@ app.delete('/api/users/:id/follow', requireAuth, async (req, res) => {
 // GET /api/users/:id/following — who this user follows
 app.get('/api/users/:id/following', requireAuth, async (req, res) => {
   const userId = Number(req.params.id);
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   try {
     const r = await query(
       `SELECT u.id, u.name FROM user_follows uf
@@ -2339,6 +2505,7 @@ app.get('/api/users/:id/following', requireAuth, async (req, res) => {
 // GET /api/users/:id/followers
 app.get('/api/users/:id/followers', requireAuth, async (req, res) => {
   const userId = Number(req.params.id);
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   try {
     const r = await query(
       `SELECT u.id, u.name FROM user_follows uf
@@ -2506,7 +2673,7 @@ app.post('/api/messages/:type/:recipientId', requireAuth, async (req, res) => {
 // =====================
 
 // POST /api/groups/:id/broadcast  — admin sends message to all members
-app.post('/api/groups/:id/broadcast', requireAuth, async (req, res) => {
+app.post('/api/groups/:id/broadcast', requireUser, async (req, res) => {
   const groupId = Number(req.params.id);
   const userId = req.user.id;
   const { content } = req.body || {};
@@ -2543,13 +2710,13 @@ app.post('/api/groups/:id/broadcast', requireAuth, async (req, res) => {
       });
       await sendEmail({
         to: m.email,
-        subject: `Message from ${groupName}`,
+        subject: `Message from ${esc(groupName)}`,
         html: `
           <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
-            <h2 style="color:#2563eb">📢 Message from ${groupName}</h2>
-            <p><strong>${senderName}</strong> sent a message to the group:</p>
+            <h2 style="color:#2563eb">📢 Message from ${esc(groupName)}</h2>
+            <p><strong>${esc(senderName)}</strong> sent a message to the group:</p>
             <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-              <p style="white-space:pre-wrap;margin:0">${content.trim()}</p>
+              <p style="white-space:pre-wrap;margin:0">${esc(content.trim())}</p>
             </div>
             <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
             <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
@@ -2836,14 +3003,14 @@ app.post('/auth/request-password-reset', resetLimiter, async (req, res) => {
       const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
       const expires = new Date(Date.now() + 1000 * 60 * 30);
       await query(
-        'INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1,$2,$3)',
-        [-studio.id, tokenHash, expires] // negative id = studio
+        'INSERT INTO password_resets (studio_id, token_hash, expires_at) VALUES ($1,$2,$3)',
+        [studio.id, tokenHash, expires]
       );
       const resetLink = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/reset?token=${token}&type=studio`;
       const html = `
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
           <h2 style="color:#2563eb">Reset your password</h2>
-          <p>Hi ${studio.name}, click below to reset your FitFlex studio password. Expires in 30 minutes.</p>
+          <p>Hi ${esc(studio.name)}, click below to reset your FitFlex studio password. Expires in 30 minutes.</p>
           <a href="${resetLink}" style="display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0">Reset Password</a>
           <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
           <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
@@ -2873,7 +3040,7 @@ app.post('/auth/request-password-reset', resetLimiter, async (req, res) => {
       const html = `
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
           <h2 style="color:#2563eb">Reset your password</h2>
-          <p>Hi ${userName}, we received a request to reset your FitFlex password.</p>
+          <p>Hi ${esc(userName)}, we received a request to reset your FitFlex password.</p>
           <p>Click the button below to set a new password. This link expires in 30 minutes.</p>
           <a href="${resetLink}" style="display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0">
             Reset Password
@@ -2904,21 +3071,21 @@ app.post('/auth/reset-password', resetLimiter, async (req, res) => {
   try {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     const found = await query(
-      `SELECT pr.user_id FROM password_resets pr
+      `SELECT pr.user_id, pr.studio_id FROM password_resets pr
        WHERE pr.token_hash=$1 AND pr.expires_at > NOW()
        ORDER BY pr.id DESC LIMIT 1`,
       [tokenHash]
     );
     if (found.rows.length === 0) return res.status(400).json({ error: 'Invalid or expired token' });
-    const rawId = found.rows[0].user_id;
+    const { user_id: userId, studio_id: studioId } = found.rows[0];
     const hashed = await bcrypt.hash(newPassword, 10);
-    if (rawId < 0) {
-      // Studio (stored as negative id)
-      await query('UPDATE studios SET password=$1 WHERE id=$2', [hashed, -rawId]);
+    if (studioId) {
+      await query('UPDATE studios SET password=$1 WHERE id=$2', [hashed, studioId]);
+      await query('DELETE FROM password_resets WHERE studio_id=$1', [studioId]);
     } else {
-      await query('UPDATE users SET password=$1 WHERE id=$2', [hashed, rawId]);
+      await query('UPDATE users SET password=$1 WHERE id=$2', [hashed, userId]);
+      await query('DELETE FROM password_resets WHERE user_id=$1', [userId]);
     }
-    await query('DELETE FROM password_resets WHERE user_id=$1', [rawId]);
     return res.json({ message: 'Password reset successful' });
   } catch (err) {
     console.error(err);
@@ -2952,18 +3119,18 @@ async function sendEventReminders() {
       const html = `
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
           <h2 style="color:#2563eb">Event reminder ⏰</h2>
-          <p>Hi ${row.user_name}, your group event is tomorrow!</p>
+          <p>Hi ${esc(row.user_name)}, your group event is tomorrow!</p>
           <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-            <p style="margin:0 0 6px"><strong>${row.title}</strong></p>
-            <p style="margin:0 0 4px;color:#555">👥 ${row.group_name}</p>
+            <p style="margin:0 0 6px"><strong>${esc(row.title)}</strong></p>
+            <p style="margin:0 0 4px;color:#555">👥 ${esc(row.group_name)}</p>
             <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
             <p style="margin:0 0 4px;color:#555">🕐 ${friendlyTime}</p>
-            ${row.location ? `<p style="margin:0;color:#555">📍 ${row.location}</p>` : ''}
+            ${row.location ? `<p style="margin:0;color:#555">📍 ${esc(row.location)}</p>` : ''}
           </div>
           <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
           <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
         </div>`;
-      return sendEmail({ to: row.user_email, subject: `Reminder: ${row.title} is tomorrow`, html });
+      return sendEmail({ to: row.user_email, subject: `Reminder: ${esc(row.title)} is tomorrow`, html });
     }));
   } catch (e) {
     console.error('[cron] Event reminder error:', e);
@@ -2995,10 +3162,10 @@ async function sendClassReminders() {
       const html = `
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
           <h2 style="color:#2563eb">Class reminder ⏰</h2>
-          <p>Hi ${row.user_name}, your class is tomorrow!</p>
+          <p>Hi ${esc(row.user_name)}, your class is tomorrow!</p>
           <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-            <p style="margin:0 0 6px"><strong>${row.class_name}</strong></p>
-            <p style="margin:0 0 4px;color:#555">📍 ${row.studio_name}${row.location ? ' · ' + row.location : ''}</p>
+            <p style="margin:0 0 6px"><strong>${esc(row.class_name)}</strong></p>
+            <p style="margin:0 0 4px;color:#555">📍 ${esc(row.studio_name)}${row.location ? ' · ' + esc(row.location) : ''}</p>
             <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
             <p style="margin:0;color:#555">🕐 ${friendlyTime}</p>
           </div>
@@ -3018,10 +3185,13 @@ async function sendClassReminders() {
 }
 
 // Run every hour at :00
-cron.schedule('0 * * * *', async () => {
-  await sendClassReminders();
-  await sendEventReminders();
-});
+// (skipped when server.js is require()d by the test suite)
+if (require.main === module) {
+  cron.schedule('0 * * * *', async () => {
+    await sendClassReminders();
+    await sendEventReminders();
+  });
+}
 
 // ---- Workout plan parser ----
 const ExcelJS = require('exceljs');
@@ -3120,7 +3290,9 @@ app.post('/api/workout-plan/export', requireAuth, async (req, res) => {
 });
 
 // ---- Start ----
-app.listen(port, '0.0.0.0', () => {
+// Exported for tests; only listen when run directly (`node server.js`).
+module.exports = { app, pool, schemaReady, esc };
+if (require.main === module) app.listen(port, '0.0.0.0', () => {
   console.log(`FitFlex backend running on http://0.0.0.0:${port}`);
   console.log(resend
     ? `[email] Resend active — sending as ${FROM_EMAIL}`
