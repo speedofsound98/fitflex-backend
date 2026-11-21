@@ -365,3 +365,11 @@ test('security headers are set and trust proxy is configured', async () => {
   assert.ok(!res.headers['x-powered-by']);
   assert.equal(app.get('trust proxy'), 1);
 });
+
+test('CORS only allows exact trusted origins (no lookalike Vercel projects)', async () => {
+  const evil = await request(app).get('/api/ping').set('Origin', 'https://fitflex-frontend-attacker.vercel.app');
+  assert.equal(evil.headers['access-control-allow-origin'], undefined);
+  const good = await request(app).get('/api/ping').set('Origin', 'https://your-portfolio-g56q.vercel.app');
+  assert.equal(good.headers['access-control-allow-origin'], 'https://your-portfolio-g56q.vercel.app');
+  assert.equal(good.headers['access-control-allow-credentials'], 'true');
+});

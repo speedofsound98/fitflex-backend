@@ -63,13 +63,24 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 const port = process.env.PORT || 3000;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Neon (and most hosted Postgres) require SSL; local dev does not
-  ssl: process.env.DATABASE_URL?.includes('neon.tech') ? { rejectUnauthorized: false } : false,
+  // Neon (and most hosted Postgres) require SSL; local dev does not.
+  // Verify the server certificate (Neon uses a publicly trusted CA); without it
+  // anyone on the network path could impersonate the DB. DB_SSL_NO_VERIFY=1 is
+  // an emergency escape hatch only.
+  ssl: process.env.DATABASE_URL?.includes('neon.tech')
+    ? { rejectUnauthorized: process.env.DB_SSL_NO_VERIFY !== '1' } // nosemgrep: bypass-tls-verification
+    : false,
 });
 const isProd = process.env.NODE_ENV === 'production';
-// In production a real secret is mandatory; never fall back to the dev value.
-if (isProd && !process.env.JWT_SECRET) {
-  throw new Error('JWT_SECRET env var is required in production');
+// A real secret is mandatory everywhere except explicit local dev/test. Failing
+// closed matters: the dev fallback below is public on GitHub, so if a deploy
+// forgot NODE_ENV=production AND JWT_SECRET, anyone could forge login tokens.
+const isLocalDev = ['development', 'test'].includes(process.env.NODE_ENV);
+if (!isLocalDev && !process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET env var is required (only NODE_ENV=development/test may omit it)');
+}
+if (!isProd && !isLocalDev) {
+  console.warn('[config] NODE_ENV is not set to production/development/test — cookies will not be cross-site capable. Set NODE_ENV=production on Render.');
 }
 const JWT_SECRET = process.env.JWT_SECRET || 'fitflex-dev-secret-change-in-prod';
 
@@ -122,15 +133,24 @@ const upload = multer({
   },
 });
 
-// CORS: allow local dev + production Vercel frontend
+// CORS (credentialed). Only exact, trusted origins in production.
+// The old /https:\/\/fitflex-frontend.*\.vercel\.app$/ pattern matched ANY Vercel
+// project named fitflex-frontend-*, which anyone can create, and those pages could
+// then make logged-in requests on a visitor's behalf.
+// Extra origins (e.g. a specific Vercel preview URL): CORS_EXTRA_ORIGINS=a,b
 const allowedOrigins = [
-  'http://localhost:5173',
   'https://your-portfolio-g56q.vercel.app',
-  /https:\/\/fitflex-frontend.*\.vercel\.app$/,
-  /http:\/\/192\.168\.\d+\.\d+(:\d+)?$/,
-  /http:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/,
+  ...(process.env.CORS_EXTRA_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean),
 ];
-if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
+if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL.replace(/\/$/, ''));
+if (!isProd) {
+  // Local dev, incl. testing from a phone on the LAN.
+  allowedOrigins.push(
+    'http://localhost:5173',
+    /^http:\/\/192\.168\.\d{1,3}\.\d{1,3}(:\d{1,5})?$/, // eslint-disable-line security/detect-unsafe-regex -- anchored, bounded, dev-only
+    /^http:\/\/10\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d{1,5})?$/, // eslint-disable-line security/detect-unsafe-regex -- anchored, bounded, dev-only
+  );
+}
 
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 
@@ -660,7 +680,8 @@ app.post('/api/signup/studio', signupLimiter, async (req, res) => {
 const DUMMY_HASH = bcrypt.hashSync('timing-equaliser-not-a-real-password', 10);
 app.post('/api/login', loginLimiter, async (req, res) => {
   try {
-    let { email, password } = req.body || {};
+    let { email } = req.body || {};
+    const { password } = req.body || {};
     if (typeof email !== 'string' || typeof password !== 'string') {
       return res.status(400).json({ error: 'email and password are required' });
     }
@@ -984,14 +1005,14 @@ app.post('/api/studios/:studioId/cover-photo', requireAuth, upload.single('photo
       overwrite: true,
       transformation: [{ width: 1200, height: 400, crop: 'fill', quality: 'auto' }],
     });
-    fs.unlinkSync(req.file.path);
+    fs.unlinkSync(req.file.path); // eslint-disable-line security/detect-non-literal-fs-filename -- multer temp path
     photoUrl = result.secure_url;
   } else {
     // Local dev: serve from /uploads
     const ext = req.file.mimetype.split('/')[1].replace('jpeg', 'jpg');
     const newName = `studio-${studioId}-${Date.now()}.${ext}`;
-    const newPath = path.join(uploadsDir, newName);
-    fs.renameSync(req.file.path, newPath);
+    const newPath = path.join(uploadsDir, newName); // nosemgrep: express-path-join-resolve-traversal -- name built from int id + whitelisted ext
+    fs.renameSync(req.file.path, newPath); // eslint-disable-line security/detect-non-literal-fs-filename -- multer temp path + server-built name
     const baseUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
     photoUrl = `${baseUrl}/uploads/${newName}`;
   }
@@ -1494,7 +1515,6 @@ app.post('/api/slots/:id/book', requireUser, writeLimiter, async (req, res) => {
     });
 
     // Notify studio
-    const studioRes = await query('SELECT id, name FROM studios WHERE id=$1', [s.studio_id]);
     const userNameRes = await query('SELECT name FROM users WHERE id=$1', [userId]);
     const friendlyTime = new Date(s.datetime).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
     await createNotification({
@@ -2180,7 +2200,7 @@ app.patch('/api/nutrition/profile', requireAuth, async (req, res) => {
     strengthMin: macroNum(p.strengthMin),
   };
   try {
-    let out = { profile };
+    const out = { profile };
     if (req.body?.goal) {
       const cur = await query(`SELECT nutrition_goal FROM users WHERE id=$1`, [req.user.id]);
       const base = cur.rows[0]?.nutrition_goal || {};
@@ -2232,7 +2252,6 @@ app.post('/api/studios/:studioId/enquire', requireUser, async (req, res) => {
     const userRes = await query('SELECT name, email FROM users WHERE id=$1', [userId]);
     if (!userRes.rows.length) return res.status(404).json({ error: 'User not found' });
     const user = userRes.rows[0];
-    const studio = studioRes.rows[0];
 
     // Create notification for studio
     await createNotification({
@@ -2843,7 +2862,6 @@ app.patch('/api/admin/blog/:id', requireAdmin, async (req, res) => {
     const newSlug = slug
       ? slug.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-')
       : cur.slug;
-    const wasPublished = cur.status === 'published';
     const willPublish = (status || cur.status) === 'published';
     const pub = willPublish ? (cur.published_at || new Date()) : null;
     const r = await query(
