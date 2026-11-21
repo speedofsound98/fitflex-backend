@@ -26,7 +26,7 @@ const jwt = require('jsonwebtoken');
 const request = require('supertest');
 const Stripe = require('stripe');
 
-let app, pool;
+let app, pool, esc;
 
 before(async () => {
   const admin = new Client({ connectionString: ADMIN_URL });
@@ -43,7 +43,7 @@ before(async () => {
   // Silence the server's startup logging/migration chatter.
   const origErr = console.error;
   console.error = () => {};
-  ({ app, pool, schemaReady } = require('../server'));
+  ({ app, pool, schemaReady, esc } = require('../server'));
   await schemaReady;
   // Startup migrations for other tables are fire-and-forget; give them a moment.
   await new Promise(r => setTimeout(r, 300));
@@ -56,7 +56,7 @@ after(async () => {
 });
 
 beforeEach(async () => {
-  await pool.query('TRUNCATE slot_bookings, appointment_slots, bookings, classes, credit_purchases, notifications, users, studios RESTART IDENTITY CASCADE');
+  await pool.query('TRUNCATE post_comments, group_posts, group_members, groups, user_follows, password_resets, slot_bookings, appointment_slots, bookings, classes, credit_purchases, notifications, users, studios RESTART IDENTITY CASCADE');
 });
 
 // ---- helpers ----
@@ -263,4 +263,105 @@ test('regular JSON routes still parse bodies', async () => {
     .send({ name: 'Pilates', datetime: future().toISOString(), credit_cost: 2, capacity: 8 });
   assert.equal(res.status, 201);
   assert.equal(res.body.class.capacity, 8);
+});
+
+// =====================================================================
+// Step 3 hardening
+// =====================================================================
+const bcrypt = require('bcryptjs');
+
+async function makeLoginUser(email, password) {
+  const hash = await bcrypt.hash(password, 4);
+  const r = await pool.query(
+    `INSERT INTO users (name, email, password) VALUES ($1,$2,$3) RETURNING id`,
+    [`n${Math.random()}`, email, hash]
+  );
+  return r.rows[0].id;
+}
+
+test('esc() neutralises HTML in user-controlled email content', () => {
+  assert.equal(esc('<a href="https://evil">Click</a> & \'x\''),
+    '&lt;a href=&quot;https://evil&quot;&gt;Click&lt;/a&gt; &amp; &#39;x&#39;');
+  assert.equal(esc(null), '');
+});
+
+test('login does not reveal whether an email has an account', async () => {
+  await makeLoginUser('real@test.dev', 'correct-horse');
+  const unknown = await request(app).post('/api/login').send({ email: 'nobody@test.dev', password: 'whatever123' });
+  const wrongPw = await request(app).post('/api/login').send({ email: 'real@test.dev', password: 'wrong-password' });
+  assert.equal(unknown.status, 401);
+  assert.equal(wrongPw.status, 401);
+  assert.deepEqual(unknown.body, wrongPw.body);
+});
+
+test('passwords with leading/trailing spaces can log in', async () => {
+  await makeLoginUser('space@test.dev', '  spaced pass  ');
+  const ok = await request(app).post('/api/login').send({ email: 'space@test.dev', password: '  spaced pass  ' });
+  assert.equal(ok.status, 200);
+});
+
+test('studio password reset works end to end', async () => {
+  await pool.query(`INSERT INTO studios (name, email, password) VALUES ('Gym', 'gym@test.dev', 'old')`);
+  const req1 = await request(app).post('/auth/request-password-reset').send({ email: 'gym@test.dev' });
+  assert.equal(req1.status, 200);
+  const token = new URL(req1.body.devResetLink).searchParams.get('token');
+
+  const reset = await request(app).post('/auth/reset-password').send({ token, newPassword: 'brand-new-pass' });
+  assert.equal(reset.status, 200);
+  const login = await request(app).post('/api/login').send({ email: 'gym@test.dev', password: 'brand-new-pass' });
+  assert.equal(login.status, 200);
+  assert.equal(login.body.user.role, 'studio');
+
+  // token is single-use
+  assert.equal((await request(app).post('/auth/reset-password').send({ token, newPassword: 'another-pass' })).status, 400);
+});
+
+test('follow notification shows the follower name, not their email', async () => {
+  const a = await makeUser();
+  const b = await makeUser();
+  assert.equal((await request(app).post(`/api/users/${b}/follow`).set(auth(a, 'user'))).status, 200);
+  const n = (await pool.query(`SELECT title FROM notifications WHERE recipient_id=$1 AND type='follow'`, [b])).rows[0];
+  assert.ok(!n.title.includes('@'), `notification leaked an email: ${n.title}`);
+});
+
+test("users can only list their own followers / following", async () => {
+  const a = await makeUser();
+  const b = await makeUser();
+  assert.equal((await request(app).get(`/api/users/${b}/followers`).set(auth(a, 'user'))).status, 403);
+  assert.equal((await request(app).get(`/api/users/${b}/following`).set(auth(a, 'user'))).status, 403);
+  assert.equal((await request(app).get(`/api/users/${a}/followers`).set(auth(a, 'user'))).status, 200);
+});
+
+test("slot listing ignores ?userId= and only marks the caller's own bookings", async () => {
+  const studio = await makeStudio();
+  const victim = await makeUser(10);
+  const snoop = await makeUser(10);
+  const slot = await makeSlot(studio, { capacity: 5 });
+  await request(app).post(`/api/slots/${slot}/book`).set(auth(victim, 'user'));
+
+  const spy = await request(app).get(`/api/studios/${studio}/slots?userId=${victim}`);
+  assert.equal(spy.body.slots[0].booked_by_user, false);
+  const spy2 = await request(app).get(`/api/studios/${studio}/slots?userId=${victim}`).set(auth(snoop, 'user'));
+  assert.equal(spy2.body.slots[0].booked_by_user, false);
+  const mine = await request(app).get(`/api/studios/${studio}/slots`).set(auth(victim, 'user'));
+  assert.equal(mine.body.slots[0].booked_by_user, true);
+});
+
+test('comments on a private-feed group are members-only', async () => {
+  const member = await makeUser();
+  const outsider = await makeUser();
+  const g = (await pool.query(`INSERT INTO groups (name, is_feed_public) VALUES ('Secret', false) RETURNING id`)).rows[0].id;
+  await pool.query(`INSERT INTO group_members (group_id, user_id, role) VALUES ($1,$2,'member')`, [g, member]);
+  const post = (await pool.query(`INSERT INTO group_posts (group_id, user_id, content) VALUES ($1,$2,'hi') RETURNING id`, [g, member])).rows[0].id;
+
+  assert.equal((await request(app).get(`/api/posts/${post}/comments`)).status, 403);
+  assert.equal((await request(app).get(`/api/posts/${post}/comments`).set(auth(outsider, 'user'))).status, 403);
+  assert.equal((await request(app).get(`/api/posts/${post}/comments`).set(auth(member, 'user'))).status, 200);
+});
+
+test('security headers are set and trust proxy is configured', async () => {
+  const res = await request(app).get('/api/ping');
+  assert.equal(res.headers['x-content-type-options'], 'nosniff');
+  assert.ok(!res.headers['x-powered-by']);
+  assert.equal(app.get('trust proxy'), 1);
 });

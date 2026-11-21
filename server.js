@@ -19,6 +19,19 @@ const path = require('path');
 const fs = require('fs');
 const cloudinary = require('cloudinary').v2;
 const sanitizeHtml = require('sanitize-html');
+const helmet = require('helmet');
+
+// Escape user-controlled text before putting it into email HTML. Without this,
+// a studio/user name or message could inject links/markup into emails that
+// arrive from FitFlex's own domain (phishing).
+function esc(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // Blog content is rendered with dangerouslySetInnerHTML on the frontend — sanitize on write.
 function cleanBlogHtml(html) {
@@ -37,6 +50,14 @@ function cleanBlogHtml(html) {
 }
 
 const app = express();
+
+// Render (and most PaaS hosts) sit behind one reverse proxy. Without this,
+// req.ip is the proxy's address, so every visitor shares one rate-limit bucket.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
+
+// Security headers. Uploaded images are loaded cross-origin by the frontend,
+// so allow cross-origin resource loading.
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
 // ---- Config ----
 const port = process.env.PORT || 3000;
@@ -191,6 +212,10 @@ const schemaReady = Promise.all([
     .catch(e => console.error('[migrate] bookings.credits_paid error:', e.message)),
   query('ALTER TABLE slot_bookings ADD COLUMN IF NOT EXISTS credits_paid INT')
     .catch(e => console.error('[migrate] slot_bookings.credits_paid error:', e.message)),
+  // Studio password resets: password_resets.user_id has an FK to users, so the
+  // old "negative id = studio" trick always failed. Give studios their own column.
+  query('ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS studio_id INT REFERENCES studios(id) ON DELETE CASCADE')
+    .catch(e => console.error('[migrate] password_resets.studio_id error:', e.message)),
   // Stripe retries webhooks — one purchase row (and one credit grant) per session.
   query('CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_purchases_session ON credit_purchases(stripe_session_id)')
     .catch(e => console.error('[migrate] credit_purchases unique index error:', e.message)),
@@ -407,10 +432,10 @@ async function sendBookingConfirmation({ userEmail, userName, studioEmail, studi
   const userHtml = `
     <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
       <h2 style="color:#2563eb">Booking Confirmed! 🎉</h2>
-      <p>Hi ${userName}, you're all set for:</p>
+      <p>Hi ${esc(userName)}, you're all set for:</p>
       <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-        <p style="margin:0 0 6px"><strong>${className}</strong></p>
-        <p style="margin:0 0 4px;color:#555">📍 ${studioName}${location ? ' · ' + location : ''}</p>
+        <p style="margin:0 0 6px"><strong>${esc(className)}</strong></p>
+        <p style="margin:0 0 4px;color:#555">📍 ${esc(studioName)}${location ? ' · ' + esc(location) : ''}</p>
         <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
         <p style="margin:0;color:#555">🕐 ${friendlyTime}</p>
       </div>
@@ -423,9 +448,9 @@ async function sendBookingConfirmation({ userEmail, userName, studioEmail, studi
   const studioHtml = `
     <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
       <h2 style="color:#2563eb">New Booking 📋</h2>
-      <p><strong>${userName}</strong> has booked a spot in:</p>
+      <p><strong>${esc(userName)}</strong> has booked a spot in:</p>
       <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-        <p style="margin:0 0 6px"><strong>${className}</strong></p>
+        <p style="margin:0 0 6px"><strong>${esc(className)}</strong></p>
         <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
         <p style="margin:0;color:#555">🕐 ${friendlyTime}</p>
       </div>
@@ -435,9 +460,9 @@ async function sendBookingConfirmation({ userEmail, userName, studioEmail, studi
 
   await Promise.all([
     emailUser
-      ? sendEmail({ to: userEmail, subject: `Booking confirmed: ${className}`, html: userHtml, icsContent })
+      ? sendEmail({ to: userEmail, subject: `Booking confirmed: ${esc(className)}`, html: userHtml, icsContent })
       : null,
-    sendEmail({ to: studioEmail, subject: `New booking: ${className} — ${userName}`, html: studioHtml }),
+    sendEmail({ to: studioEmail, subject: `New booking: ${esc(className)} — ${esc(userName)}`, html: studioHtml }),
   ]);
 }
 
@@ -450,9 +475,9 @@ async function sendCancellationNotice({ userEmail, userName, studioEmail, studio
   const userHtml = `
     <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
       <h2 style="color:#dc2626">Booking Cancelled</h2>
-      <p>Hi ${userName}, your booking has been cancelled:</p>
+      <p>Hi ${esc(userName)}, your booking has been cancelled:</p>
       <div style="background:#fef2f2;border-radius:12px;padding:16px;margin:16px 0">
-        <p style="margin:0 0 6px"><strong>${className}</strong> @ ${studioName}</p>
+        <p style="margin:0 0 6px"><strong>${esc(className)}</strong> @ ${esc(studioName)}</p>
         <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate} · ${friendlyTime}</p>
       </div>
       <p style="color:#555"><strong>${creditCost} credit${creditCost !== 1 ? 's' : ''}</strong> have been refunded to your account.</p>
@@ -463,9 +488,9 @@ async function sendCancellationNotice({ userEmail, userName, studioEmail, studio
   const studioHtml = `
     <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
       <h2 style="color:#dc2626">Booking Cancelled</h2>
-      <p><strong>${userName}</strong> has cancelled their booking for:</p>
+      <p><strong>${esc(userName)}</strong> has cancelled their booking for:</p>
       <div style="background:#fef2f2;border-radius:12px;padding:16px;margin:16px 0">
-        <p style="margin:0 0 6px"><strong>${className}</strong></p>
+        <p style="margin:0 0 6px"><strong>${esc(className)}</strong></p>
         <p style="margin:0;color:#555">📅 ${friendlyDate} · ${friendlyTime}</p>
       </div>
       <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
@@ -632,6 +657,7 @@ app.post('/api/signup/studio', signupLimiter, async (req, res) => {
 });
 
 // POST /api/login
+const DUMMY_HASH = bcrypt.hashSync('timing-equaliser-not-a-real-password', 10);
 app.post('/api/login', loginLimiter, async (req, res) => {
   try {
     let { email, password } = req.body || {};
@@ -639,7 +665,8 @@ app.post('/api/login', loginLimiter, async (req, res) => {
       return res.status(400).json({ error: 'email and password are required' });
     }
     email = email.trim().toLowerCase();
-    password = password.trim();
+    // Don't trim the password: signup/reset store it untrimmed, so trimming
+    // here locked out anyone whose password starts/ends with a space.
 
     // Try users
     let r = await query('SELECT id, name, email, password FROM users WHERE lower(email)=$1', [email]);
@@ -663,7 +690,10 @@ app.post('/api/login', loginLimiter, async (req, res) => {
       return res.json({ user: { id: s.id, name: s.name, email: s.email, role: 'studio' }, token });
     }
 
-    return res.status(404).json({ error: 'No account found for this email' });
+    // Same response + similar timing as a wrong password, so the login form
+    // can't be used to discover which emails have accounts.
+    await bcrypt.compare(password, DUMMY_HASH);
+    return res.status(401).json({ error: 'Invalid credentials' });
   } catch (err) {
     console.error('[login] error', err);
     return res.status(500).json({ error: 'Server error' });
@@ -1162,14 +1192,14 @@ app.post('/api/classes/:classId/message', requireAuth, writeLimiter, async (req,
 
     const html = `
       <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
-        <h2 style="color:#2563eb">Message from ${cls.studio_name} 📣</h2>
+        <h2 style="color:#2563eb">Message from ${esc(cls.studio_name)} 📣</h2>
         <p>You have a message regarding your upcoming class:</p>
         <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-          <p style="margin:0 0 6px"><strong>${cls.name}</strong></p>
+          <p style="margin:0 0 6px"><strong>${esc(cls.name)}</strong></p>
           <p style="margin:0;color:#555">📅 ${friendlyDate} · ${friendlyTime}</p>
         </div>
         <div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin:16px 0">
-          <p style="white-space:pre-wrap;margin:0;color:#1a1a1a">${message.trim()}</p>
+          <p style="white-space:pre-wrap;margin:0;color:#1a1a1a">${esc(message.trim())}</p>
         </div>
         <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
         <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
@@ -1349,7 +1379,11 @@ app.get('/api/users/:userId/purchases', requireAuth, async (req, res) => {
 app.get('/api/studios/:id/slots', async (req, res) => {
   const studioId = Number(req.params.id);
   if (!Number.isInteger(studioId)) return res.status(400).json({ error: 'Invalid studio id' });
-  const { from, to, userId } = req.query;
+  const { from, to } = req.query;
+  // Which slots *I* booked — derived from the session, never from a query param
+  // (?userId= let anyone see any user's appointment bookings).
+  const viewer = optionalAuth(req);
+  const userId = viewer?.role === 'user' ? viewer.id : null;
   try {
     let sql = `
       SELECT s.id, s.datetime, s.duration_minutes, s.capacity, s.credit_cost, s.notes,
@@ -1823,6 +1857,19 @@ app.get('/api/posts/:id/comments', async (req, res) => {
   const postId = Number(req.params.id);
   if (!Number.isInteger(postId)) return res.status(400).json({ error: 'Invalid post id' });
   try {
+    // Same visibility rule as the group feed: private feeds are members-only.
+    const g = await query(
+      `SELECT g.id, g.is_feed_public FROM group_posts p JOIN groups g ON g.id = p.group_id WHERE p.id=$1`,
+      [postId]
+    );
+    if (!g.rows.length) return res.status(404).json({ error: 'Post not found' });
+    if (!g.rows[0].is_feed_public) {
+      const viewer = optionalAuth(req);
+      const member = viewer?.role === 'user' && (await query(
+        'SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2', [g.rows[0].id, viewer.id]
+      )).rows.length;
+      if (!member) return res.status(403).json({ error: 'Join the group to see comments', feedPrivate: true });
+    }
     const r = await query(
       `SELECT c.id, c.content, c.created_at, u.id AS user_id, u.name AS user_name
          FROM post_comments c JOIN users u ON u.id = c.user_id
@@ -2199,15 +2246,15 @@ app.post('/api/studios/:studioId/enquire', requireUser, async (req, res) => {
     // Also send email to studio (non-blocking)
     sendEmail({
       to: (await query('SELECT email FROM studios WHERE id=$1', [studioId])).rows[0]?.email,
-      subject: `New enquiry from ${user.name}`,
+      subject: `New enquiry from ${esc(user.name)}`,
       html: `
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
           <h2 style="color:#2563eb">New Enquiry 💬</h2>
-          <p><strong>${user.name}</strong> (${user.email}) sent you an enquiry:</p>
+          <p><strong>${esc(user.name)}</strong> (${esc(user.email)}) sent you an enquiry:</p>
           <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-            <p style="white-space:pre-wrap;margin:0">${message.trim()}</p>
+            <p style="white-space:pre-wrap;margin:0">${esc(message.trim())}</p>
           </div>
-          <p style="color:#888;font-size:13px">Reply directly to ${user.email}</p>
+          <p style="color:#888;font-size:13px">Reply directly to ${esc(user.email)}</p>
           <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
           <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
         </div>`,
@@ -2419,10 +2466,11 @@ app.post('/api/users/:id/follow', requireUser, async (req, res) => {
       'INSERT INTO user_follows (follower_id, following_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
       [followerId, followingId]
     );
-    const target = await query('SELECT name FROM users WHERE id=$1', [followingId]);
+    if (!Number.isInteger(followingId)) return res.status(400).json({ error: 'Invalid user id' });
+    const follower = await query('SELECT name FROM users WHERE id=$1', [followerId]);
     await createNotification({
       recipientType: 'user', recipientId: followingId,
-      type: 'follow', title: `${req.user.email} is now following you`,
+      type: 'follow', title: `${follower.rows[0]?.name || 'Someone'} is now following you`,
       body: 'Someone new is following your activity.',
     });
     res.json({ ok: true });
@@ -2442,6 +2490,7 @@ app.delete('/api/users/:id/follow', requireUser, async (req, res) => {
 // GET /api/users/:id/following — who this user follows
 app.get('/api/users/:id/following', requireAuth, async (req, res) => {
   const userId = Number(req.params.id);
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   try {
     const r = await query(
       `SELECT u.id, u.name FROM user_follows uf
@@ -2456,6 +2505,7 @@ app.get('/api/users/:id/following', requireAuth, async (req, res) => {
 // GET /api/users/:id/followers
 app.get('/api/users/:id/followers', requireAuth, async (req, res) => {
   const userId = Number(req.params.id);
+  if (!ownsUser(req, userId)) return res.status(403).json(FORBIDDEN);
   try {
     const r = await query(
       `SELECT u.id, u.name FROM user_follows uf
@@ -2660,13 +2710,13 @@ app.post('/api/groups/:id/broadcast', requireUser, async (req, res) => {
       });
       await sendEmail({
         to: m.email,
-        subject: `Message from ${groupName}`,
+        subject: `Message from ${esc(groupName)}`,
         html: `
           <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
-            <h2 style="color:#2563eb">📢 Message from ${groupName}</h2>
-            <p><strong>${senderName}</strong> sent a message to the group:</p>
+            <h2 style="color:#2563eb">📢 Message from ${esc(groupName)}</h2>
+            <p><strong>${esc(senderName)}</strong> sent a message to the group:</p>
             <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-              <p style="white-space:pre-wrap;margin:0">${content.trim()}</p>
+              <p style="white-space:pre-wrap;margin:0">${esc(content.trim())}</p>
             </div>
             <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
             <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
@@ -2953,14 +3003,14 @@ app.post('/auth/request-password-reset', resetLimiter, async (req, res) => {
       const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
       const expires = new Date(Date.now() + 1000 * 60 * 30);
       await query(
-        'INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1,$2,$3)',
-        [-studio.id, tokenHash, expires] // negative id = studio
+        'INSERT INTO password_resets (studio_id, token_hash, expires_at) VALUES ($1,$2,$3)',
+        [studio.id, tokenHash, expires]
       );
       const resetLink = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/reset?token=${token}&type=studio`;
       const html = `
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
           <h2 style="color:#2563eb">Reset your password</h2>
-          <p>Hi ${studio.name}, click below to reset your FitFlex studio password. Expires in 30 minutes.</p>
+          <p>Hi ${esc(studio.name)}, click below to reset your FitFlex studio password. Expires in 30 minutes.</p>
           <a href="${resetLink}" style="display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0">Reset Password</a>
           <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
           <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
@@ -2990,7 +3040,7 @@ app.post('/auth/request-password-reset', resetLimiter, async (req, res) => {
       const html = `
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
           <h2 style="color:#2563eb">Reset your password</h2>
-          <p>Hi ${userName}, we received a request to reset your FitFlex password.</p>
+          <p>Hi ${esc(userName)}, we received a request to reset your FitFlex password.</p>
           <p>Click the button below to set a new password. This link expires in 30 minutes.</p>
           <a href="${resetLink}" style="display:inline-block;background:#2563eb;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0">
             Reset Password
@@ -3021,21 +3071,21 @@ app.post('/auth/reset-password', resetLimiter, async (req, res) => {
   try {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
     const found = await query(
-      `SELECT pr.user_id FROM password_resets pr
+      `SELECT pr.user_id, pr.studio_id FROM password_resets pr
        WHERE pr.token_hash=$1 AND pr.expires_at > NOW()
        ORDER BY pr.id DESC LIMIT 1`,
       [tokenHash]
     );
     if (found.rows.length === 0) return res.status(400).json({ error: 'Invalid or expired token' });
-    const rawId = found.rows[0].user_id;
+    const { user_id: userId, studio_id: studioId } = found.rows[0];
     const hashed = await bcrypt.hash(newPassword, 10);
-    if (rawId < 0) {
-      // Studio (stored as negative id)
-      await query('UPDATE studios SET password=$1 WHERE id=$2', [hashed, -rawId]);
+    if (studioId) {
+      await query('UPDATE studios SET password=$1 WHERE id=$2', [hashed, studioId]);
+      await query('DELETE FROM password_resets WHERE studio_id=$1', [studioId]);
     } else {
-      await query('UPDATE users SET password=$1 WHERE id=$2', [hashed, rawId]);
+      await query('UPDATE users SET password=$1 WHERE id=$2', [hashed, userId]);
+      await query('DELETE FROM password_resets WHERE user_id=$1', [userId]);
     }
-    await query('DELETE FROM password_resets WHERE user_id=$1', [rawId]);
     return res.json({ message: 'Password reset successful' });
   } catch (err) {
     console.error(err);
@@ -3069,18 +3119,18 @@ async function sendEventReminders() {
       const html = `
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
           <h2 style="color:#2563eb">Event reminder ⏰</h2>
-          <p>Hi ${row.user_name}, your group event is tomorrow!</p>
+          <p>Hi ${esc(row.user_name)}, your group event is tomorrow!</p>
           <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-            <p style="margin:0 0 6px"><strong>${row.title}</strong></p>
-            <p style="margin:0 0 4px;color:#555">👥 ${row.group_name}</p>
+            <p style="margin:0 0 6px"><strong>${esc(row.title)}</strong></p>
+            <p style="margin:0 0 4px;color:#555">👥 ${esc(row.group_name)}</p>
             <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
             <p style="margin:0 0 4px;color:#555">🕐 ${friendlyTime}</p>
-            ${row.location ? `<p style="margin:0;color:#555">📍 ${row.location}</p>` : ''}
+            ${row.location ? `<p style="margin:0;color:#555">📍 ${esc(row.location)}</p>` : ''}
           </div>
           <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
           <p style="color:#aaa;font-size:12px">FitFlex — your fitness marketplace</p>
         </div>`;
-      return sendEmail({ to: row.user_email, subject: `Reminder: ${row.title} is tomorrow`, html });
+      return sendEmail({ to: row.user_email, subject: `Reminder: ${esc(row.title)} is tomorrow`, html });
     }));
   } catch (e) {
     console.error('[cron] Event reminder error:', e);
@@ -3112,10 +3162,10 @@ async function sendClassReminders() {
       const html = `
         <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1a1a1a">
           <h2 style="color:#2563eb">Class reminder ⏰</h2>
-          <p>Hi ${row.user_name}, your class is tomorrow!</p>
+          <p>Hi ${esc(row.user_name)}, your class is tomorrow!</p>
           <div style="background:#f0f7ff;border-radius:12px;padding:16px;margin:16px 0">
-            <p style="margin:0 0 6px"><strong>${row.class_name}</strong></p>
-            <p style="margin:0 0 4px;color:#555">📍 ${row.studio_name}${row.location ? ' · ' + row.location : ''}</p>
+            <p style="margin:0 0 6px"><strong>${esc(row.class_name)}</strong></p>
+            <p style="margin:0 0 4px;color:#555">📍 ${esc(row.studio_name)}${row.location ? ' · ' + esc(row.location) : ''}</p>
             <p style="margin:0 0 4px;color:#555">📅 ${friendlyDate}</p>
             <p style="margin:0;color:#555">🕐 ${friendlyTime}</p>
           </div>
@@ -3241,7 +3291,7 @@ app.post('/api/workout-plan/export', requireAuth, async (req, res) => {
 
 // ---- Start ----
 // Exported for tests; only listen when run directly (`node server.js`).
-module.exports = { app, pool, schemaReady };
+module.exports = { app, pool, schemaReady, esc };
 if (require.main === module) app.listen(port, '0.0.0.0', () => {
   console.log(`FitFlex backend running on http://0.0.0.0:${port}`);
   console.log(resend
